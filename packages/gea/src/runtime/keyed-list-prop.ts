@@ -96,7 +96,7 @@ export function keyedListProp(cfg: PropKeyedListConfig): void {
         }
       }
 
-      if (aipuOnly && changes!.length === 2) {
+      if (aipuOnly && changes!.length > 1 && changes!.length < 3) {
         const a = changes![0].arix as number
         const b = changes![1].arix as number
         if (a >= 0 && b >= 0 && a < entries.length && b < entries.length && a !== b) {
@@ -177,7 +177,7 @@ export function keyedListProp(cfg: PropKeyedListConfig): void {
         totalRemoved += (change.count as number) || 0
       }
       if (onlyRemoves && entries.length - arr.length === totalRemoved) {
-        if (changes.length === 1 && (changes[0].count as number) === 1) {
+        if (changes.length < 2 && (changes[0].count as number) === 1) {
           const idx = changes[0].start as number
           if (idx >= 0 && idx < entries.length) {
             removeEntry(entries[idx])
