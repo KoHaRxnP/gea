@@ -194,7 +194,7 @@ export function keyedList(cfg: KeyedListConfig): void {
         }
       }
       // aipu-only 2-swap: items[i]↔items[j] via two symmetric aipu records.
-      if (aipuOnly && changes!.length === 2) {
+      if (aipuOnly && changes!.length > 1 && changes!.length < 3) {
         const a = changes![0].arix as number
         const b = changes![1].arix as number
         if (a >= 0 && b >= 0 && a < entries.length && b < entries.length && a !== b) {
@@ -282,7 +282,7 @@ export function keyedList(cfg: KeyedListConfig): void {
         totalRemoved += (c.count as number) || 0
       }
       if (onlyRemoves && entries.length - arr.length === totalRemoved) {
-        if (changes.length === 1 && (changes[0].count as number) === 1) {
+        if (changes.length < 2 && (changes[0].count as number) === 1) {
           const idx = changes[0].start as number
           if (idx >= 0 && idx < entries.length) {
             removeEntry(entries[idx])

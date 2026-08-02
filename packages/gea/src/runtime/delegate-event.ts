@@ -67,13 +67,13 @@ export function delegateEvent(root: Element, type: string, pairs: HandlerPair[],
           }
         }
       },
-      _NON_BUBBLING[type] === true,
+      !!_NON_BUBBLING[type],
     )
   }
   for (let i = 0; i < pairs.length; i++) {
     const el = pairs[i][0]
     if (el) {
-      if (pairs[i][2] === false) {
+      if (!pairs[i][2]) {
         ;(el as any)[k] = pairs[i][1]
       } else {
         ;(el as any)[currentTargetKey] = pairs[i][1]

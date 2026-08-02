@@ -24,7 +24,7 @@ const _toFlush = new Set<Pending>()
 const _live = new WeakMap<Pending, LiveEntries>()
 const _claimed = new WeakSet<Entry>()
 const _claimable = new WeakSet<Entry>()
-let _pendingBulk: PendingBulkBatch[] | null = null
+let _pendingBulk: PendingBulkBatch[] = []
 let _flushQueued = false
 
 const _unwrap = (v: any): any => (v && typeof v === 'object' && v[GEA_PROXY_RAW]) || v
@@ -74,7 +74,7 @@ function _schedule(): void {
     const drainMaps = Array.from(_toFlush)
     const bulk = _pendingBulk
     _toFlush.clear()
-    _pendingBulk = null
+    _pendingBulk = []
     for (let i = 0; i < drainMaps.length; i++) {
       const m = drainMaps[i]
       for (const e of m.values()) {
@@ -86,7 +86,7 @@ function _schedule(): void {
       }
       m.clear()
     }
-    if (bulk) {
+    if (bulk.length > 0) {
       for (let i = 0; i < bulk.length; i++) {
         const batch = bulk[i].entries
         for (let j = 0; j < batch.length; j++) {
@@ -125,8 +125,7 @@ export function _deferBulk(pending: Pending, entries: Entry[]): void {
   }
   if (next.length === 0) return
   const batch: PendingBulkBatch = { pending, entries: next }
-  if (_pendingBulk) _pendingBulk.push(batch)
-  else _pendingBulk = [batch]
+  _pendingBulk.push(batch)
   _schedule()
 }
 
@@ -140,7 +139,7 @@ export function _rescue(pending: Pending, key: string, item?: any): Entry | null
   // Lazy fallback: materialize any pending bulk batches into their target
   // pending maps so cross-site rescue still works without paying per-row
   // Map.set on the common no-rescue-needed bulk path.
-  if (_pendingBulk) {
+  if (_pendingBulk.length > 0) {
     for (let i = 0; i < _pendingBulk.length; i++) {
       const batch = _pendingBulk[i]
       const target = batch.pending
@@ -148,7 +147,7 @@ export function _rescue(pending: Pending, key: string, item?: any): Entry | null
       for (let j = 0; j < items.length; j++) target.set(String(items[j].key), items[j])
       _toFlush.add(target)
     }
-    _pendingBulk = null
+    _pendingBulk = []
     const r = pending.get(key)
     if (r) {
       pending.delete(key)
