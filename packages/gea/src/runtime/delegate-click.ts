@@ -42,12 +42,14 @@ export function delegateClick(root: Element, pairs: HandlerPair[], disposer?: Di
     if (el) (el as unknown as HandlerStash)[_GC] = pairs[i][1]
   }
   // Disposer-contained storage: one registration per call (not per pair), so
-  // the live-path cost stays a single push — and a noop disposer skips even
-  // that. Clearing on dispose bounds every stashed handler's lifetime to the
-  // owning component: the handlers capture the component's `this`, and under
-  // refcounted ownership an uncleared stash would keep the component alive
-  // through its own DOM (component → element → handler → component).
-  if (disposer) disposer.add(_clearHandlers(pairs))
+  // the live-path cost stays a single push. The `noop` check runs here, not
+  // inside `add`, so the noop fast path (keyed-list rows with no cleanup)
+  // allocates nothing — not even the teardown closure. Clearing on dispose
+  // bounds every stashed handler's lifetime to the owning component: the
+  // handlers capture the component's `this`, and under refcounted ownership
+  // an uncleared stash would keep the component alive through its own DOM
+  // (component → element → handler → component).
+  if (disposer && !disposer.noop) disposer.add(_clearHandlers(pairs))
 }
 
 function _clearHandlers(pairs: HandlerPair[]): () => void {
