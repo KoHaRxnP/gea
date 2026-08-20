@@ -59,7 +59,8 @@ export function transformCompiledStoreModule(
     ir: fallbackIrs[0],
     irs: fallbackIrs,
   }
-  if (/\b(flushSync|silent|Store\.|new\s+Store\s*\()/.test(source)) {
+  const codeWithoutComments = source.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '')
+  if (/\b(flushSync|silent|Store\.|new\s+Store\s*\()/.test(codeWithoutComments)) {
     return fallback
   }
   // All-or-nothing across the module's store classes: a partial transform
