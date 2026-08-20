@@ -20,6 +20,13 @@ export interface StoreTransformResult {
 
 export type ResolveImportPath = (importer: string, source: string) => string | null
 
+function stripComments(code: string): string {
+  return code.replace(
+    /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\/\*[\s\S]*?\*\/|\/\/.*)/g,
+    (match, stringGroup) => (stringGroup ? stringGroup : '')
+  )
+}
+
 export function transformCompiledStoreModule(
   source: string,
   moduleId = '<unknown>',
@@ -59,7 +66,7 @@ export function transformCompiledStoreModule(
     ir: fallbackIrs[0],
     irs: fallbackIrs,
   }
-  const codeWithoutComments = source.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '')
+  const codeWithoutComments = stripComments(source)
   if (/\b(flushSync|silent|Store\.|new\s+Store\s*\()/.test(codeWithoutComments)) {
     return fallback
   }

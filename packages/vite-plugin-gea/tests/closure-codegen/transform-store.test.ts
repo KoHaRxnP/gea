@@ -45,4 +45,19 @@ describe('transformCompiledStoreModule', () => {
     assert.strictEqual(result.changed, false)
     assert.doesNotMatch(result.code, /CompiledStore/)
   })
+
+  it('should fall back when Store. is called on the same line after // in string literal', () => {
+    const input = `
+      import { Store } from '@geajs/core'
+      const url = "https://example.com"; Store.someMethod()
+      export class MyStore extends Store {
+        data = []
+        run() {}
+      }
+      export default new MyStore()
+    `
+    const result = transformCompiledStoreModule(input, 'MyStore.ts')
+    assert.ok(result)
+    assert.strictEqual(result.changed, false)
+  })
 })
