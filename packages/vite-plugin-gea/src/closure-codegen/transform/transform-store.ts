@@ -37,7 +37,7 @@ function hasUnsafeStorePattern(ast: File, storeLocalName: string): boolean {
     }
 
     if (
-      t.isMemberExpression(node) &&
+      (t.isMemberExpression(node) || t.isOptionalMemberExpression(node)) &&
       t.isIdentifier(node.object, { name: storeLocalName })
     ) {
       unsafe = true

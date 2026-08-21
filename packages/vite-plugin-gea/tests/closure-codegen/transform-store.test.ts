@@ -71,6 +71,20 @@ describe('transformCompiledStoreModule', () => {
     assert.doesNotMatch(result.code, /extends Compiled(?:Lean)?Store/)
   })
 
+  it('should fall back when optional Store member access (Store?.someMethod) is present', () => {
+    const input = `
+      import { Store } from '@geajs/core'
+      Store?.someMethod()
+      export class MyStore extends Store {}
+      export default new MyStore()
+    `
+
+    const result = transformCompiledStoreModule(input, 'MyStore.ts')
+    assert.ok(result)
+    assert.strictEqual(result.changed, false)
+    assert.doesNotMatch(result.code, /extends Compiled(?:Lean)?Store/)
+  })
+
   it('should fall back when Store. is called after // inside a string literal', () => {
     const input = `
       import { Store } from '@geajs/core'
