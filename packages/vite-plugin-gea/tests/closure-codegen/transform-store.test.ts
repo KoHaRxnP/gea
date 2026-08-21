@@ -29,7 +29,32 @@ describe('transformCompiledStoreModule', () => {
     const result = transformCompiledStoreModule(input, 'MyStore.ts')
     assert.ok(result)
     assert.strictEqual(result.changed, true)
-    assert.match(result.code, /Compiled/)
+    assert.match(result.code, /extends Compiled(?:Lean)?Store/)
+  })
+
+  it('should transform without false positives from single-line comments containing Store.', () => {
+    const input = `
+      import { Store } from '@geajs/core'
+      // FIXME: Store.reset() needs fix
+      export class MyStore extends Store {
+        data = []
+        selected = null
+        run() {}
+        runLots() {}
+        add() {}
+        update() {}
+        clear() {}
+        swapRows() {}
+        select() {}
+        remove() {}
+      }
+      export default new MyStore()
+    `
+
+    const result = transformCompiledStoreModule(input, 'MyStore.ts')
+    assert.ok(result)
+    assert.strictEqual(result.changed, true)
+    assert.match(result.code, /extends Compiled(?:Lean)?Store/)
   })
 
   it('should fall back when source code contains static Store. calls', () => {
@@ -43,10 +68,10 @@ describe('transformCompiledStoreModule', () => {
     const result = transformCompiledStoreModule(input, 'MyStore.ts')
     assert.ok(result)
     assert.strictEqual(result.changed, false)
-    assert.doesNotMatch(result.code, /CompiledStore/)
+    assert.doesNotMatch(result.code, /extends Compiled(?:Lean)?Store/)
   })
 
-  it('should fall back when Store. is called on the same line after // in string literal', () => {
+  it('should fall back when Store. is called after // inside a string literal', () => {
     const input = `
       import { Store } from '@geajs/core'
       const url = "https://example.com"; Store.someMethod()
@@ -59,5 +84,6 @@ describe('transformCompiledStoreModule', () => {
     const result = transformCompiledStoreModule(input, 'MyStore.ts')
     assert.ok(result)
     assert.strictEqual(result.changed, false)
+    assert.doesNotMatch(result.code, /extends Compiled(?:Lean)?Store/)
   })
 })
