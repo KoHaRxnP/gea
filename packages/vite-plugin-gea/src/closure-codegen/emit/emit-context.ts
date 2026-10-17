@@ -69,6 +69,13 @@ export interface EmitContext {
    */
   bindings: Map<string, Expression>
   /**
+   * Binds the locals a guard branch declares (see `foldConditionalReturn`)
+   * into `bindings` the way the component's own body binds them, and returns
+   * the statements the branch must keep. Set for function components; class
+   * templates drop a branch's declarations instead.
+   */
+  bindBranchLocals?: (stmts: Statement[], bindings: Map<string, Expression>) => Statement[]
+  /**
    * Names of `get`-accessor methods on the current class. Used to force
    * getter-form for `this.X` reactive bindings when `X` is a derived value —
    * path form would only track `this.X` but derived getters frequently read
@@ -145,12 +152,23 @@ export function createEmitContext(reactiveRoot?: Expression): EmitContext {
  *   - `const a = expr.path`                    → a → expr.path
  * Non-reactive sources (literals, numeric exprs) are still recorded; the
  * substitution just passes them through, which is harmless.
+ *
+ * `keepLocal` opts declarations out: their names stay real locals (and shadow
+ * any outer binding), so callers must keep those declarations in the output.
  */
-export function collectBindings(stmts: Statement[], bindings: Map<string, Expression>): void {
+export function collectBindings(
+  stmts: Statement[],
+  bindings: Map<string, Expression>,
+  keepLocal?: (init: Expression) => boolean,
+): void {
   for (const stmt of stmts) {
     if (!t.isVariableDeclaration(stmt)) continue
     for (const decl of stmt.declarations) {
       if (!decl.init) continue
+      if (keepLocal?.(decl.init)) {
+        for (const name of Object.keys(t.getBindingIdentifiers(decl.id))) bindings.delete(name)
+        continue
+      }
       if (t.isObjectPattern(decl.id)) {
         for (const prop of decl.id.properties) {
           if (!t.isObjectProperty(prop)) continue
@@ -168,6 +186,26 @@ export function collectBindings(stmts: Statement[], bindings: Map<string, Expres
       }
     }
   }
+}
+
+/**
+ * True when evaluating `init` again at every read would change behavior: it
+ * constructs something whose identity must survive (`new`, `class`), or it
+ * writes state. Such a local has to stay a real variable. Nested function
+ * bodies are skipped because they don't run when the local is read.
+ */
+export function initializerNeedsLocal(node: any): boolean {
+  if (!node || typeof node !== 'object') return false
+  if (t.isNewExpression(node) || t.isClassExpression(node)) return true
+  if (t.isAssignmentExpression(node) || t.isUpdateExpression(node)) return true
+  if (t.isUnaryExpression(node, { operator: 'delete' })) return true
+  if (t.isFunction(node)) return false
+  if (Array.isArray(node)) return node.some(initializerNeedsLocal)
+  for (const key of Object.keys(node)) {
+    if (key === 'loc' || key === 'start' || key === 'end' || key === 'type') continue
+    if (initializerNeedsLocal(node[key])) return true
+  }
+  return false
 }
 
 /** Shallow clone to avoid AST aliasing hazards when substituting. */

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { CompiledLeanStore } from '../src/runtime/compiled-lean-store'
+import { _plain, CompiledLeanStore } from '../src/runtime/compiled-lean-store'
 import { CompiledStore } from '../src/runtime/compiled-store'
 
 async function flush() {
@@ -8,6 +8,21 @@ async function flush() {
 }
 
 describe('CompiledLeanStore runtime semantics', () => {
+  it('exports the tracked-proxy plain-value v1 browser fallback', () => {
+    class Nominal {}
+    const raw = { value: 1 }
+    const proxy = new Proxy(raw, {})
+    const nullPrototype = Object.create(null) as Record<string, unknown>
+
+    assert.equal(_plain(raw), true)
+    assert.equal(_plain(proxy), true)
+    assert.equal(_plain(nullPrototype), true)
+    assert.equal(_plain([]), true)
+    assert.equal(_plain(new Nominal()), false)
+    assert.equal(_plain(null), false)
+    assert.equal(_plain('value'), false)
+  })
+
   it('keeps nested array proxies scoped by root prop when a getter aliases an array', async () => {
     class TodoStore extends CompiledLeanStore {
       todos = [{ id: 'a', done: false }]
@@ -155,4 +170,52 @@ describe('CompiledStore runtime semantics', () => {
 
     assert.deepEqual(seen, ['value', 'other'])
   })
+})
+
+describe('compiled stores return class values unbound (#133)', () => {
+  class Home {
+    static title = 'Home page'
+  }
+
+  for (const [label, Base] of [
+    ['CompiledLeanStore', CompiledLeanStore],
+    ['CompiledStore', CompiledStore],
+  ] as const) {
+    it(`${label} returns a class read from a field or a getter as the class itself`, () => {
+      class ViewStore extends Base {
+        view: unknown = Home
+        get current() {
+          return this.view
+        }
+      }
+
+      const store = new ViewStore() as any
+      for (const prop of ['view', 'current']) {
+        const value = store[prop]
+        assert.equal(value, Home, prop)
+        assert.equal(store[prop], value, prop)
+        assert.equal(value.name, 'Home', prop)
+        assert.equal(value.title, 'Home page', prop)
+      }
+    })
+
+    it(`${label} still binds methods to the store`, async () => {
+      class CounterStore extends Base {
+        count = 0
+        inc(): void {
+          this.count++
+        }
+      }
+
+      const store = new CounterStore() as any
+      const seen: number[] = []
+      store.observe('count', (value: number) => seen.push(value))
+      const { inc } = store
+      inc()
+      await flush()
+
+      assert.equal(store.count, 1)
+      assert.deepEqual(seen, [1])
+    })
+  }
 })
