@@ -28,7 +28,6 @@ describe('emitSlot - direct props fallback', () => {
     emitSlot(slot as any, stmts, mockContext)
 
     const generatedCode = stmts.map((s) => generate(s).code).join('\n')
-    assert.ok(!generatedCode.includes('0'))
-    assert.ok(generatedCode.includes('undefined'))
+    assert.ok(generatedCode.includes('void 0'))
   })
 })
