@@ -39,6 +39,17 @@ const handleInput = e => {
 }
 ```
 
+## Spread Attributes
+
+Spread an object onto an HTML element to set several attributes at once:
+
+```jsx
+const { children, ...rest } = this.props
+return <button class="btn" {...rest}>{children}</button>
+```
+
+Keys are applied in source order: a spread overrides the attributes written before it, and attributes written after it override the spread. The spread stays live. When the object changes, changed keys are written and keys that are gone are removed. `on*` keys in any letter case (and bare event names like `click`) become event handlers; one whose value is not a function is ignored. `class`, `style`, `value`, `visible` and boolean attributes work as they do when written directly. `children`, `key`, `ref`, `dangerouslySetInnerHTML` and keys that are not valid attribute names are ignored. No key is assigned as an element property: `innerHTML` in the object is an ordinary `innerhtml` attribute. Spread values for URL attributes (`href`, `src`, `action`, `formaction` and the others `geaSanitizeAttr` lists) go through `geaSanitizeAttr`, which empties a `javascript:`, `vbscript:` or non-image `data:` URL. This includes a URL attribute written before the spread on the same element, since the spread applies it too. `srcdoc` is skipped, and so are `attributeName`, `to`, `from`, `by` and `values` on SVG animation elements (`animate`, `set`, `animateMotion`, `animateTransform`); on other elements, such as `values` on `feColorMatrix`, a spread sets them as usual.
+
 ## Differences from React
 
 | Feature | Gea | React |
@@ -64,16 +75,18 @@ Use curly braces for dynamic content:
 Gea supports inline style objects with camelCase property names, like React:
 
 ```jsx
-// Static — compiled to a CSS string at build time
+// Constant style object
 <div style={{ backgroundColor: 'red', fontSize: '14px', fontWeight: 'bold' }}>
   Styled content
 </div>
 
-// Dynamic — converted to cssText at runtime
+// Dynamic — updated per property at runtime
 <div style={{ color: this.textColor, opacity: this.isVisible ? 1 : 0 }}>
   Dynamic styling
 </div>
 ```
+
+Numeric style-object values receive `px` for dimensional properties: a style object containing `height: 120` produces `height: 120px`. Unitless properties such as `opacity` and `lineHeight`, custom properties (`--*`), and zero do not receive added units. Explicit strings keep their units. This is Gea runtime behavior, not a requirement of JSX syntax.
 
 String styles are also supported and passed through as-is:
 
@@ -151,8 +164,9 @@ The compiler throws clear errors at build time for these patterns:
 
 | Pattern | Fix |
 | --- | --- |
-| `<div {...props} />` | Destructure and pass props individually |
 | Dynamic tag names | Use conditional rendering instead |
 | `{() => <div />}` (function as child) | Use named render prop attributes |
 | `export function Foo() { return <div /> }` | Use `export default function` |
 | Fragments as `.map()` item roots | Wrap in a single root element |
+
+Spreading onto a component tag (`<Comp {...props} />`) is not supported yet, and it raises no error: the compiler drops the spread, so the component receives none of those props ([#198](https://github.com/dashersw/gea/issues/198)). Pass the props individually.

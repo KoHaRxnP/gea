@@ -1,9 +1,31 @@
-import type { ClassDeclaration, Statement } from '@babel/types'
+import type {
+  ClassDeclaration,
+  ClassMethod,
+  Expression,
+  File,
+  FunctionDeclaration,
+  FunctionParameter,
+  Identifier,
+  ObjectPattern,
+  ObjectProperty,
+  Statement,
+  VariableDeclaration,
+  VariableDeclarator,
+} from '@babel/types'
 
-import { t } from '../../utils/babel-interop.ts'
+import { t, traverse } from '../../utils/babel-interop.ts'
+import { compilerError } from '../../utils/compile-error.ts'
 
-import { collectBindings, compileJsxToBlock, createEmitContext, substituteBindings, type EmitContext } from '../emit.ts'
+import {
+  collectBindings,
+  compileJsxToBlock,
+  createEmitContext,
+  initializerNeedsLocal,
+  substituteBindings,
+  type EmitContext,
+} from '../emit.ts'
 import { extractTemplateJsx, findTemplateMethod } from '../generator.ts'
+import { foldConditionalReturn, isConditionalJsxRoot } from './transform-template-methods.ts'
 
 export function extendsComponent(classDecl: ClassDeclaration): boolean {
   const sc = classDecl.superClass
@@ -32,6 +54,14 @@ export function bodyContainsJsx(node: any): boolean {
     }
   }
   return false
+}
+
+/** Does the class, a member or a member's parameter carry a decorator? */
+export function classHasDecorators(classDecl: ClassDeclaration): boolean {
+  if (classDecl.decorators?.length) return true
+  return (classDecl.body.body as any[]).some(
+    (member) => member.decorators?.length || member.params?.some((param: any) => param.decorators?.length),
+  )
 }
 
 export function canSkipComponentStoreProxy(classDecl: ClassDeclaration): boolean {
@@ -200,7 +230,10 @@ function nodeContainsIdentifier(node: any, name: string): boolean {
   return false
 }
 
-/** True if the function body returns a JSX expression (PascalCase name + JSX return). */
+/**
+ * True if the function body returns a JSX expression (PascalCase name + JSX
+ * return), or picks one with a condition (`c ? <A/> : <B/>`, `c && <A/>`).
+ */
 export function isFunctionComponent(fn: any): boolean {
   if (!fn.id || !t.isIdentifier(fn.id)) return false
   const name = fn.id.name
@@ -208,11 +241,188 @@ export function isFunctionComponent(fn: any): boolean {
   // Look for a return <JSX/> in the body
   if (!fn.body || !t.isBlockStatement(fn.body)) return false
   for (const stmt of fn.body.body) {
-    if (t.isReturnStatement(stmt) && stmt.argument) {
-      if (t.isJSXElement(stmt.argument) || t.isJSXFragment(stmt.argument)) return true
+    if (t.isReturnStatement(stmt) && isJsxRoot(stmt.argument)) return true
+  }
+  return false
+}
+
+function isJsxRoot(node: any): boolean {
+  return t.isJSXElement(node) || t.isJSXFragment(node) || isConditionalJsxRoot(node)
+}
+
+/**
+ * True if the body keeps a per-instance local (see `initializerNeedsLocal`),
+ * e.g. `const store = new CounterStore()`. Reads of such a local must stay
+ * reactive, so the component can't be compiled as a one-shot direct factory.
+ */
+export function fnHasInstanceLocals(fn: any): boolean {
+  for (const stmt of fn.body?.body ?? []) {
+    if (t.isReturnStatement(stmt)) break
+    if (t.isVariableDeclaration(stmt) && stmt.declarations.some((d) => d.init && initializerNeedsLocal(d.init))) {
+      return true
     }
   }
   return false
+}
+
+/** Value bindings declared at the top level of a module: imports, variables, functions, classes, enums. */
+export function collectModuleBindings(ast: File): Set<string> {
+  const names = new Set<string>()
+  for (const stmt of ast.program.body) {
+    if (t.isImportDeclaration(stmt)) {
+      if (stmt.importKind === 'type' || stmt.importKind === 'typeof') continue
+      for (const spec of stmt.specifiers) {
+        if (t.isImportSpecifier(spec) && (spec.importKind === 'type' || spec.importKind === 'typeof')) continue
+        names.add(spec.local.name)
+      }
+      continue
+    }
+    const decl = t.isExportNamedDeclaration(stmt) || t.isExportDefaultDeclaration(stmt) ? stmt.declaration : stmt
+    if (t.isVariableDeclaration(decl) || t.isFunctionDeclaration(decl) || t.isClassDeclaration(decl)) {
+      for (const name of Object.keys(t.getOuterBindingIdentifiers(decl))) names.add(name)
+    } else if (t.isTSEnumDeclaration(decl)) {
+      names.add(decl.id.name)
+    }
+  }
+  return names
+}
+
+/**
+ * True if the function reads one of `moduleBindings` (see
+ * `collectModuleBindings`), e.g. `{counter.count}` for an imported store.
+ * A one-shot direct factory would write that read once and never update it.
+ * JSX tags don't count: rendering a component isn't a read, and the child
+ * keeps its own bindings. Locals that shadow a module name and type
+ * annotations don't count either.
+ */
+export function fnReadsModuleBinding(fn: FunctionDeclaration, moduleBindings: Set<string>): boolean {
+  if (moduleBindings.size === 0) return false
+  let reads = false
+  traverse(t.file(t.program([t.cloneNode(fn, true)])), {
+    enter(path) {
+      if (isTypeOnlyNode(path.node)) path.skip()
+    },
+    Identifier(path) {
+      const name = path.node.name
+      if (!moduleBindings.has(name) || !path.isReferencedIdentifier() || path.scope.getBinding(name)) return
+      reads = true
+      path.stop()
+    },
+  })
+  return reads
+}
+
+function isTypeOnlyNode(node: any): boolean {
+  return (
+    t.isTSType(node) ||
+    t.isTSTypeAnnotation(node) ||
+    t.isTSTypeParameterInstantiation(node) ||
+    t.isTSTypeParameterDeclaration(node) ||
+    t.isTSTypeAliasDeclaration(node) ||
+    t.isTSInterfaceDeclaration(node)
+  )
+}
+
+/**
+ * True if the body picks its root with a condition, which `rewriteFnComponent`
+ * folds into a `conditional()` reading `props`. A one-shot direct factory has
+ * no `props`, so such a component has to be mounted.
+ */
+export function fnHasConditionalRoot(fn: any): boolean {
+  const body: Statement[] = fn.body?.body ?? []
+  const returnIdx = body.findIndex((s) => t.isReturnStatement(s))
+  if (returnIdx < 0) return false
+  if (isConditionalJsxRoot((body[returnIdx] as any).argument)) return true
+  return body.slice(0, returnIdx).some((stmt) => findJsxReturn(stmt) !== null)
+}
+
+/**
+ * Function components have no local state yet: the body runs once per
+ * instance and reads of its locals are inlined into the JSX, so a reassigned
+ * `let` can never reach the DOM (and used to compile to `0++`). Fail the build
+ * with a pointer to the supported alternatives instead.
+ */
+function assertNoReassignedLocals(fnDecl: any, fnName: string, preceding: Statement[]): void {
+  const found = findReassignedLocal(fnDecl, preceding)
+  if (!found) return
+
+  throw compilerError(
+    `Function component \`${fnName || '<anonymous>'}\` reassigns \`${found.name}\`.`,
+    found.write,
+    `Function components have no local state yet, so the new value would never render. ` +
+      `Keep \`${found.name}\` in a Store or a class component.`,
+  )
+}
+
+/**
+ * A class `template()` runs once per instance too, and its locals are inlined
+ * the same way, so a reassigned `let` there fails the build as well.
+ */
+export function assertNoReassignedTemplateLocals(
+  templateMethod: ClassMethod,
+  className: string,
+  preceding: Statement[],
+): void {
+  const params = templateMethod.params as FunctionParameter[]
+  const found = findReassignedLocal(t.functionExpression(null, params, templateMethod.body), preceding)
+  if (!found) return
+
+  throw compilerError(
+    `Class component \`${className}\` reassigns \`${found.name}\` in template().`,
+    found.write,
+    `template() runs once per instance, so the new value would never render. ` +
+      `Make \`${found.name}\` a class field and write \`this.${found.name}\` instead, or keep it in a Store.`,
+  )
+}
+
+/** The first write, anywhere in `fnDecl`, to a `let` or `var` declared in `preceding`. */
+function findReassignedLocal(fnDecl: any, preceding: Statement[]): { name: string; write: any } | null {
+  const mutable = new Set<string>()
+  for (const stmt of preceding) {
+    if (!t.isVariableDeclaration(stmt) || stmt.kind === 'const') continue
+    for (const decl of stmt.declarations) {
+      for (const name of Object.keys(t.getBindingIdentifiers(decl.id))) mutable.add(name)
+    }
+  }
+  if (mutable.size === 0) return null
+
+  let name = ''
+  let write: any = null
+  const fn = t.cloneNode(fnDecl, true)
+  traverse(t.file(t.program([t.isStatement(fn) ? fn : t.expressionStatement(fn)])), {
+    Function(path) {
+      path.stop()
+      for (const local of mutable) {
+        const violation = path.scope.getOwnBinding(local)?.constantViolations[0]
+        if (violation) {
+          name = local
+          write = violation.node
+          return
+        }
+      }
+    },
+  })
+  return write ? { name, write } : null
+}
+
+/** A `return` of JSX inside `node`, not counting nested functions. */
+function findJsxReturn(node: any): any {
+  if (!node || typeof node !== 'object') return null
+  if (t.isFunction(node)) return null
+  if (t.isReturnStatement(node)) return isJsxRoot(node.argument) ? node : null
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findJsxReturn(child)
+      if (found) return found
+    }
+    return null
+  }
+  for (const key of Object.keys(node)) {
+    if (key === 'loc' || key === 'start' || key === 'end' || key === 'type') continue
+    const found = findJsxReturn(node[key])
+    if (found) return found
+  }
+  return null
 }
 
 /**
@@ -225,20 +435,18 @@ export function isFunctionComponent(fn: any): boolean {
  */
 export function rewriteFnComponent(fnDecl: any, parentCtx: EmitContext): void {
   const body = fnDecl.body.body as Statement[]
-  let returnIdx = -1
-  for (let i = 0; i < body.length; i++) {
-    if (t.isReturnStatement(body[i])) {
-      returnIdx = i
-      break
-    }
-  }
-  if (returnIdx < 0) return
-  const ret = body[returnIdx] as any
-  if (!ret.argument || !(t.isJSXElement(ret.argument) || t.isJSXFragment(ret.argument))) return
-  const jsxRoot = ret.argument
+  let returnIdx = body.findIndex((s) => t.isReturnStatement(s))
+  if (returnIdx < 0 || !isJsxRoot((body[returnIdx] as any).argument)) return
+
+  const fnName = t.isIdentifier(fnDecl.id) ? fnDecl.id.name : ''
+  // Checked before folding, which moves locals declared after a guard into
+  // the guard's branch.
+  assertNoReassignedLocals(fnDecl, fnName, body.slice(0, returnIdx))
+  foldConditionalReturn(body)
+  returnIdx = body.findIndex((s) => t.isReturnStatement(s))
+  const jsxRoot = (body[returnIdx] as any).argument
 
   const fnCtx = createEmitContext(t.identifier('props'))
-  const fnName = t.isIdentifier(fnDecl.id) ? fnDecl.id.name : ''
   fnCtx.oneShotProps = parentCtx.directFnComponents?.has(fnName) === true
   const directParams = fnCtx.oneShotProps ? parentCtx.directFnComponentParams?.get(fnName) : undefined
   // Share the tpl/list counters with the parent so hoisted _tplN names don't collide
@@ -248,6 +456,7 @@ export function rewriteFnComponent(fnDecl: any, parentCtx: EmitContext): void {
   fnCtx.directFnComponentParams = parentCtx.directFnComponentParams
   fnCtx.directFnStringProps = parentCtx.directFnStringProps
   fnCtx.directFnNoDisposer = parentCtx.directFnNoDisposer
+  fnCtx.directClassComponents = parentCtx.directClassComponents
   // Share IR template recording with the parent so functional components also
   // produce an IR template record. Without this, `emit-core.ts` skips the
   // `irTemplates.push(...)` because the function's `fnCtx.currentIrComponent`
@@ -271,7 +480,10 @@ export function rewriteFnComponent(fnDecl: any, parentCtx: EmitContext): void {
   // `const { draft, onAdd } = props` because that captures the thunk
   // results once. Instead populate ctx.bindings so every identifier
   // reference in JSX expressions substitutes to `props.<name>` (which
-  // hits the live thunk on each read).
+  // hits the live thunk on each read). `const { … } = props` in the body
+  // goes through the same path below.
+  const propsLocals: Statement[] = []
+  if (!directParams) renameOwnPropsBindings(fnDecl)
   if (directParams) {
     fnDecl.params = directParams.locals.map((name) => t.identifier(name))
     fnCtx.oneShotPropLocals = new Set(directParams.locals)
@@ -281,36 +493,21 @@ export function rewriteFnComponent(fnDecl: any, parentCtx: EmitContext): void {
         directParams.locals.filter((local, index) => stringProps.has(directParams.props[index])),
       )
     }
-  } else if (fnDecl.params.length >= 1 && t.isObjectPattern(fnDecl.params[0])) {
-    const objPat = fnDecl.params[0] as any
-    for (const prop of objPat.properties) {
-      if (!t.isObjectProperty(prop) || !t.isIdentifier(prop.key)) continue
-      const local = t.isIdentifier(prop.value) ? prop.value.name : prop.key.name
-      fnCtx.bindings.set(local, t.memberExpression(t.identifier('props'), t.identifier(prop.key.name)))
-    }
-    fnDecl.params[0] = t.identifier('props')
   } else if (fnDecl.params.length === 0) {
     fnDecl.params.push(t.identifier('props'))
-  } else if (!t.isIdentifier(fnDecl.params[0], { name: 'props' })) {
+  } else {
+    const param = propsParam(fnDecl.params[0], fnName)
+    if (t.isObjectPattern(param)) propsLocals.push(...bindPropsPattern(param, 'let', fnCtx.bindings))
+    else if (param.name !== 'props') fnCtx.bindings.set(param.name, t.identifier('props'))
     fnDecl.params[0] = t.identifier('props')
   }
 
   // Collect bindings from preceding `const X = expr` declarations so reactive
   // getters substitute X transitively (X → its RHS → further bindings).
   // Must happen BEFORE compileJsxToBlock so the JSX walker sees the bindings.
-  const precedingRaw: Statement[] = []
-  for (let i = 0; i < returnIdx; i++) {
-    const s = body[i]
-    if (t.isVariableDeclaration(s)) {
-      const allFromProps = s.declarations.every(
-        (d) => t.isObjectPattern(d.id) && t.isIdentifier((d as any).init, { name: 'props' }),
-      )
-      if (allFromProps) continue
-    }
-    precedingRaw.push(s)
-  }
-  // collectBindings is imported from emit.ts
-  collectBindings(precedingRaw, fnCtx.bindings)
+  // A guard's branch binds the locals folded into it the same way.
+  const precedingRaw: Statement[] = [...propsLocals, ...bindFnLocals(body.slice(0, returnIdx), fnCtx.bindings)]
+  fnCtx.bindBranchLocals = bindFnLocals
 
   const jsxBlock = compileJsxToBlock(jsxRoot, fnCtx)
   if (
@@ -343,4 +540,241 @@ export function rewriteFnComponent(fnDecl: any, parentCtx: EmitContext): void {
   }
 
   fnDecl.body.body = newBody
+}
+
+/**
+ * Bind the locals a function component declares before its JSX so reads
+ * inline through to `props`, and return the statements that stay in the
+ * body. `const { … } = props` binds through `bindPropsDestructures`.
+ */
+function bindFnLocals(stmts: Statement[], bindings: Map<string, Expression>): Statement[] {
+  const propsLocals: Statement[] = []
+  const kept = bindPropsDestructures(stmts, (init) => t.isIdentifier(init, { name: 'props' }), bindings, propsLocals)
+  // Props locals stay real variables, so they must not be inlined as
+  // bindings. Locals that construct objects or write state stay real
+  // variables too, created once per instance (or per render of a guard's
+  // branch); inlining them would re-run the initializer on each read.
+  collectBindings(
+    kept.filter((s) => !propsLocals.includes(s)),
+    bindings,
+    initializerNeedsLocal,
+  )
+  return kept
+}
+
+/**
+ * Give the function's own bindings called `props` fresh names. The compiled
+ * component takes `props` as its first parameter, so `...props` in
+ * `({ class: cls, ...props })`, a `const props` or a callback's `props`
+ * parameter would collide with it or hide it from the reads the compiler
+ * inlines. A props parameter already called `props` is the one it keeps.
+ */
+function renameOwnPropsBindings(fnDecl: any): void {
+  const param = t.isAssignmentPattern(fnDecl.params[0]) ? fnDecl.params[0].left : fnDecl.params[0]
+  const kept = t.isIdentifier(param, { name: 'props' }) ? param : null
+  // A throwaway file, as in renameSelfReferences, gives fresh scopes; the
+  // renames land on the function's own nodes.
+  traverse(t.file(t.program([t.isStatement(fnDecl) ? fnDecl : t.expressionStatement(fnDecl)])), {
+    Scope(path) {
+      const binding = path.scope.getOwnBinding('props')
+      if (binding && binding.identifier !== kept) path.scope.rename('props')
+    },
+  })
+}
+
+/**
+ * The props parameter as bound in the body. A whole-parameter default
+ * (`({ label } = {})`, `(p = {})`) is dropped: mount() and direct same-file
+ * calls always pass a props object, so it never applies. Any other shape
+ * can't be bound to `props` and fails the build.
+ */
+function propsParam(param: any, fnName: string): Identifier | ObjectPattern {
+  const target = t.isAssignmentPattern(param) ? param.left : param
+  if (t.isIdentifier(target) || t.isObjectPattern(target)) return target
+  throw compilerError(
+    `Function component \`${fnName || '<anonymous>'}\` has an unsupported props parameter.`,
+    param,
+    'Name the parameter (`props`) or destructure it (`{ label }`).',
+  )
+}
+
+/**
+ * Bind every `const { … } = <props>` declarator in `stmts` through
+ * bindPropsPattern and put the locals the pattern still needs in its place.
+ * Those locals are real variables, so they are also added to `propsLocals`
+ * for the caller to keep out of collectBindings.
+ */
+export function bindPropsDestructures(
+  stmts: Statement[],
+  isProps: (init: Expression | null | undefined) => boolean,
+  bindings: Map<string, Expression>,
+  propsLocals: Statement[],
+  base?: Expression,
+): Statement[] {
+  const isPropsDestructure = (decl: VariableDeclarator) =>
+    t.isObjectPattern(decl.id) && isProps(withoutTypes(decl.init))
+  const out: Statement[] = []
+  for (const s of stmts) {
+    if (!t.isVariableDeclaration(s) || !s.declarations.some(isPropsDestructure)) {
+      out.push(s)
+      continue
+    }
+    for (const decl of s.declarations) {
+      if (!isPropsDestructure(decl)) continue
+      const locals = bindPropsPattern(decl.id as ObjectPattern, s.kind, bindings, base)
+      out.push(...locals)
+      propsLocals.push(...locals)
+    }
+    const others = s.declarations.filter((decl) => !isPropsDestructure(decl))
+    if (others.length > 0) out.push(t.variableDeclaration(s.kind, others))
+  }
+  return out
+}
+
+/**
+ * Bind a props destructuring pattern so every name reads through `base`
+ * (`props` unless given, `this.props` in a class) on each access instead of
+ * capturing the value once:
+ *   `{ title }`       → title = props.title
+ *   `{ class: cls }`  → cls = props.class
+ *   `{ size = 'md' }` → size = props.size === undefined ? 'md' : props.size
+ *   `{ user: { first } }` → first = props.user.first, with `props.user` as the
+ *                         base of the nested pattern (its default applied)
+ *   `{ ...rest }`     → a real local whose getters read through to `props`
+ * Returns the statements that must stay in the body as real locals. Array
+ * patterns, computed keys and nested defaults with a `new` or a call stay a
+ * plain destructure of their base, as does the whole pattern when a computed
+ * key makes the rest element's excluded keys unknown.
+ */
+export function bindPropsPattern(
+  pattern: ObjectPattern,
+  kind: VariableDeclaration['kind'],
+  bindings: Map<string, Expression>,
+  base: Expression = t.identifier('props'),
+): Statement[] {
+  const rest = pattern.properties.find((prop) => t.isRestElement(prop))
+  const keys: string[] = []
+  for (const prop of pattern.properties) {
+    if (t.isRestElement(prop)) continue
+    const key = staticPropKey(prop)
+    if (key !== null) keys.push(key)
+    else if (rest)
+      return [declareLocal(t.variableDeclaration(kind, [t.variableDeclarator(pattern, t.cloneNode(base))]), bindings)]
+  }
+
+  const locals: Statement[] = []
+  const unbound: ObjectProperty[] = []
+  for (const prop of pattern.properties) {
+    if (t.isRestElement(prop)) continue
+    const key = staticPropKey(prop)
+    const target = t.isAssignmentPattern(prop.value) ? prop.value.left : prop.value
+    // A nested default with effects (`= new Guest()`, `= getGuest()`) runs once, as a real local
+    const onceDefault =
+      t.isObjectPattern(target) &&
+      t.isAssignmentPattern(prop.value) &&
+      (initializerNeedsLocal(prop.value.right) || containsCall(prop.value.right))
+    if (key === null || onceDefault || !(t.isIdentifier(target) || t.isObjectPattern(target))) {
+      unbound.push(prop)
+      continue
+    }
+    const read = () =>
+      t.isValidIdentifier(key, false)
+        ? t.memberExpression(t.cloneNode(base), t.identifier(key))
+        : t.memberExpression(t.cloneNode(base), t.stringLiteral(key), true)
+    const value = t.isAssignmentPattern(prop.value)
+      ? t.conditionalExpression(
+          t.binaryExpression('===', read(), t.identifier('undefined')),
+          t.cloneNode(prop.value.right, true),
+          read(),
+        )
+      : read()
+    if (t.isIdentifier(target)) bindings.set(target.name, value)
+    else locals.push(...bindPropsPattern(target, kind, bindings, value))
+  }
+  if (unbound.length > 0) {
+    locals.push(
+      declareLocal(
+        t.variableDeclaration(kind, [t.variableDeclarator(t.objectPattern(unbound), t.cloneNode(base))]),
+        bindings,
+      ),
+    )
+  }
+
+  if (rest && t.isIdentifier(rest.argument)) {
+    // Same shape as the direct factory props object in emit-mount.ts: one
+    // enumerable getter per remaining prop, so reads stay live.
+    const restId = t.identifier(rest.argument.name)
+    const keyId = t.identifier('__restKey')
+    const define = t.expressionStatement(
+      t.callExpression(t.memberExpression(t.identifier('Object'), t.identifier('defineProperty')), [
+        t.cloneNode(restId),
+        t.cloneNode(keyId),
+        t.objectExpression([
+          t.objectProperty(t.identifier('enumerable'), t.booleanLiteral(true)),
+          t.objectProperty(t.identifier('configurable'), t.booleanLiteral(true)),
+          t.objectProperty(
+            t.identifier('get'),
+            t.arrowFunctionExpression([], t.memberExpression(t.cloneNode(base), t.cloneNode(keyId), true)),
+          ),
+        ]),
+      ]),
+    )
+    const excluded = keys.map((key) => t.binaryExpression('!==', t.cloneNode(keyId), t.stringLiteral(key)))
+    const test = excluded.reduce<Expression | null>(
+      (acc, cur) => (acc ? t.logicalExpression('&&', acc, cur) : cur),
+      null,
+    )
+    locals.push(
+      declareLocal(t.variableDeclaration(kind, [t.variableDeclarator(restId, t.objectExpression([]))]), bindings),
+      t.forInStatement(
+        t.variableDeclaration('const', [t.variableDeclarator(keyId)]),
+        t.cloneNode(base),
+        test ? t.ifStatement(test, define) : define,
+      ),
+    )
+  }
+  return locals
+}
+
+/** A call outside a nested function, which may have effects. */
+function containsCall(node: any): boolean {
+  if (!node || typeof node !== 'object') return false
+  if (t.isCallExpression(node) || t.isOptionalCallExpression(node) || t.isTaggedTemplateExpression(node)) return true
+  if (t.isFunction(node)) return false
+  if (Array.isArray(node)) return node.some(containsCall)
+  for (const key of Object.keys(node)) {
+    if (key === 'loc' || key === 'start' || key === 'end' || key === 'type') continue
+    if (containsCall(node[key])) return true
+  }
+  return false
+}
+
+/** `props as Props`, `props!` and `(props)` all read `props`. */
+function withoutTypes(expr: Expression | null | undefined): Expression | null | undefined {
+  while (
+    t.isTSAsExpression(expr) ||
+    t.isTSSatisfiesExpression(expr) ||
+    t.isTSNonNullExpression(expr) ||
+    t.isTSTypeAssertion(expr) ||
+    t.isParenthesizedExpression(expr)
+  ) {
+    expr = expr.expression
+  }
+  return expr
+}
+
+/**
+ * A real local shadows any binding of the same name, such as one left by an
+ * earlier class in the file, so drop it.
+ */
+function declareLocal(decl: VariableDeclaration, bindings: Map<string, Expression>): VariableDeclaration {
+  for (const name of Object.keys(t.getBindingIdentifiers(decl))) bindings.delete(name)
+  return decl
+}
+
+function staticPropKey(prop: ObjectProperty): string | null {
+  if (!prop.computed && t.isIdentifier(prop.key)) return prop.key.name
+  if (t.isStringLiteral(prop.key)) return prop.key.value
+  if (t.isNumericLiteral(prop.key)) return String(prop.key.value)
+  return null
 }

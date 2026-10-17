@@ -3,8 +3,18 @@ import type { ClassDeclaration, Expression, File, ImportDeclaration, Statement }
 import { existsSync, readFileSync } from 'node:fs'
 
 import { COMPILER_RUNTIME_ID } from '../../virtual-modules.ts'
+import { parseModule } from '../../parse/parser.ts'
 import { generate, t } from '../../utils/babel-interop.ts'
-import { sourceSpan, storeFieldsToIr, storeGettersToIr, storeIrId, storeMethodsToIr, type GeaIrConstant, type GeaIrStore } from '../ir.ts'
+import {
+  sourceSpan,
+  storeFieldsToIr,
+  storeGettersToIr,
+  storeIrId,
+  storeMethodsToIr,
+  type GeaIrConstant,
+  type GeaIrStore,
+} from '../ir.ts'
+import { classHasDecorators } from './transform-components.ts'
 
 export interface StoreTransformResult {
   code: string
@@ -30,11 +40,7 @@ export function transformCompiledStoreModule(
 
   let ast: File
   try {
-    ast = parse(source, {
-      sourceType: 'module',
-      plugins: ['typescript', 'jsx', 'classProperties', 'classPrivateProperties', 'classPrivateMethods'],
-      errorRecovery: false,
-    })
+    ast = parseModule(source)
   } catch {
     return null
   }
@@ -346,11 +352,7 @@ function literalConstantsFromFile(file: string, names: Set<string>): GeaIrConsta
   if (!existsSync(file)) return []
   let ast: File
   try {
-    ast = parse(readFileSync(file, 'utf8'), {
-      sourceType: 'module',
-      plugins: ['typescript', 'jsx', 'classProperties'],
-      errorRecovery: false,
-    })
+    ast = parseModule(readFileSync(file, 'utf8'))
   } catch {
     return []
   }
@@ -374,7 +376,12 @@ function moduleFreeFunctionNames(ast: File): Set<string> {
   const names = new Set<string>()
   for (const node of ast.program.body) {
     if (t.isFunctionDeclaration(node) && node.id) names.add(node.id.name)
-    else if (t.isExportNamedDeclaration(node) && node.declaration && t.isFunctionDeclaration(node.declaration) && node.declaration.id) {
+    else if (
+      t.isExportNamedDeclaration(node) &&
+      node.declaration &&
+      t.isFunctionDeclaration(node.declaration) &&
+      node.declaration.id
+    ) {
       names.add(node.declaration.id.name)
     }
   }
@@ -390,7 +397,15 @@ function nodeReferencesIdentifier(node: unknown, name: string): boolean {
   const record = node as Record<string, unknown>
   if (record.type === 'Identifier' && record.name === name) return true
   for (const key of Object.keys(record)) {
-    if (key === 'type' || key === 'loc' || key === 'start' || key === 'end' || key === 'leadingComments' || key === 'trailingComments') continue
+    if (
+      key === 'type' ||
+      key === 'loc' ||
+      key === 'start' ||
+      key === 'end' ||
+      key === 'leadingComments' ||
+      key === 'trailingComments'
+    )
+      continue
     if (nodeReferencesIdentifier(record[key], name)) return true
   }
   return false
@@ -569,11 +584,7 @@ function moduleExportsStore(file: string, resolveImportPath: ResolveImportPath, 
 
   let ast: File
   try {
-    ast = parse(readFileSync(file, 'utf8'), {
-      sourceType: 'module',
-      plugins: ['typescript', 'jsx', 'classProperties'],
-      errorRecovery: false,
-    })
+    ast = parseModule(readFileSync(file, 'utf8'))
   } catch {
     storeExportCache.set(file, false)
     return false
@@ -640,6 +651,8 @@ function findStoreClasses(ast: File, storeName: string): ClassDeclaration[] {
 }
 
 function isCompiledStoreSafeClass(classDecl: ClassDeclaration): boolean {
+  // Decorators can rewrite the class at runtime; the runtime Store handles that.
+  if (classHasDecorators(classDecl)) return false
   for (const member of classDecl.body.body as any[]) {
     if (member.static) return false
     if (t.isClassPrivateMethod(member) || t.isClassPrivateProperty(member)) return false

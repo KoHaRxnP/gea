@@ -44,11 +44,11 @@ export default class App extends Component {
 
     assert.equal(changed, true)
     assert.ok(importsNeeded.includes('scheduleAfterRenderAsync'))
+    assert.match(code, /import \{[^}]*scheduleAfterRenderAsync[^}]*\} from ["']virtual:gea-compiler-runtime["']/)
     assert.match(
       code,
-      /import \{[^}]*scheduleAfterRenderAsync[^}]*\} from ["']virtual:gea-compiler-runtime["']/,
+      /render\(parent, _index\) \{[\s\S]*super\.render\(parent, _index\);[\s\S]*scheduleAfterRenderAsync\(this\);/,
     )
-    assert.match(code, /render\(parent, _index\) \{[\s\S]*super\.render\(parent, _index\);[\s\S]*scheduleAfterRenderAsync\(this\);/)
   })
 
   it('keeps event-only static components on the single-element static base', () => {
@@ -211,7 +211,7 @@ export default class App extends Component {
 }`
     const { code } = transformFile(src)
     assert.match(code, /mount\(/)
-    assert.match(code, /reactiveTextValue\(/)
+    assert.match(code, /reactiveText\(t0, d, props, \(\) => props\.count\)/)
     assert.doesNotMatch(code, /const __n0 = Note\(\{/)
   })
 
@@ -230,6 +230,19 @@ export default class Card extends Component {
     assert.match(code, /Object\.defineProperty\(__fp\d+, __k\d+,/)
     assert.match(code, /Icon\(__fp\d+, __fd\d+\)/)
     assert.doesNotMatch(code, /get type\(\)\s*\{\s*return this\.props\.type/)
+  })
+
+  it('constructs known class components directly inside function components', () => {
+    const src = `import Button from './Button'
+export default function Toolbar() {
+  return <div class="toolbar"><Button>Save</Button></div>
+}`
+    const { code } = transformFile(src, '/virtual/Toolbar.tsx', {
+      directClassComponents: new Set(['Button']),
+    })
+
+    assert.match(code, /const __c\d+ = new Button\(\)/)
+    assert.doesNotMatch(code, /mount\(/)
   })
 
   it('adds import if @geajs/core was never imported', () => {
@@ -312,4 +325,21 @@ export default class App extends Component {
     assert.doesNotMatch(code, /relationalClass\(/)
     assert.match(code, /reactiveClassName\(/)
   })
+})
+
+it('preserves reactive component constructor work when removing the native marker', () => {
+  const { code, changed } = transformFile(
+    `import { ReactiveComponent } from '@geajs/core'
+    class Counter extends ReactiveComponent {
+      count = 0
+      constructor() { super(); this.count = 1 }
+      template() { return <div>{this.count}</div> }
+    }`,
+    '/virtual/Counter.tsx',
+    { embedded: true },
+  )
+  assert.equal(changed, true)
+  assert.match(code, /constructor\(\)/)
+  assert.match(code, /this.count = 1/)
+  assert.doesNotMatch(code, /super\(/)
 })

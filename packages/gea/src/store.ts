@@ -11,6 +11,7 @@
 import { GEA_PROXY_RAW, GEA_STORE_ROOT } from './runtime/symbols'
 import { GEA_OBSERVE_DIRECT } from './runtime/internal-symbols'
 import { trackRead } from './runtime/with-tracking'
+import { isClassConstructorValue } from './runtime/class-constructor'
 export { GEA_DIRTY, GEA_DIRTY_PROPS } from './runtime/dirty-symbols'
 import { GEA_DIRTY as _DIRTY, GEA_DIRTY_PROPS as _DIRTY_PROPS } from './runtime/dirty-symbols'
 
@@ -44,6 +45,8 @@ export interface Change {
   count?: number
   /** In-place array-item property update — arix = item index in the parent array. */
   aipu?: boolean
+  /** The item carries dirty-property metadata for the keyed-list fast path. */
+  itemDirty?: boolean
   arix?: number
   /** Value after change. */
   newValue?: any
@@ -61,16 +64,6 @@ export function samePathParts(a?: string[], b?: string[]): boolean {
   if (len !== b.length) return false
   for (let i = 0; i < len; i++) if (a[i] !== b[i]) return false
   return true
-}
-
-export function isClassConstructorValue(fn: unknown): boolean {
-  if (typeof fn !== 'function') return false
-  try {
-    const d = Object.getOwnPropertyDescriptor(fn, 'prototype')
-    return !!(d && d.writable === false)
-  } catch {
-    return true
-  }
 }
 
 /**

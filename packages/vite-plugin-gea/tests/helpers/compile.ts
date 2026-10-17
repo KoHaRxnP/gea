@@ -31,6 +31,7 @@ import { relationalClass } from '../../../gea/src/runtime/relational-class'
 import { relationalClassProp } from '../../../gea/src/runtime/relational-class-prop'
 import { reactiveStyle, reactiveStyleProp } from '../../../gea/src/runtime/reactive-style'
 import { reactiveValue, reactiveValueRead } from '../../../gea/src/runtime/reactive-value'
+import { reactiveSpread, spreadAttrs } from '../../../gea/src/runtime/reactive-spread'
 import { delegateEvent } from '../../../gea/src/runtime/delegate-event'
 import { delegateEventFast } from '../../../gea/src/runtime/delegate-event-fast'
 import { delegateClick, ensureClickDelegate } from '../../../gea/src/runtime/delegate-click'
@@ -42,7 +43,7 @@ import { keyedList, GEA_DOM_ITEM, GEA_DOM_KEY } from '../../../gea/src/runtime/k
 import { keyedListSimple } from '../../../gea/src/runtime/keyed-list-simple'
 import { keyedListProp } from '../../../gea/src/runtime/keyed-list-prop'
 import { _rescue } from '../../../gea/src/runtime/keyed-list/rescue'
-import { createItemObservable, createItemProxy } from '../../../gea/src/runtime/keyed-list/item-obs'
+import { createItemObservable, createItemProxy, readItem } from '../../../gea/src/runtime/keyed-list/item-obs'
 import { GEA_DIRTY, GEA_DIRTY_PROPS } from '../../../gea/src/runtime/dirty-symbols'
 import type { GeaHmrBindings } from './gea-hmr-runtime'
 
@@ -85,6 +86,8 @@ export const geaRuntimeForEval: Record<string, unknown> = {
   reactiveStyleProp,
   reactiveValue,
   reactiveValueRead,
+  reactiveSpread,
+  spreadAttrs,
   reactiveHtml,
   delegateEvent,
   delegateEventFast,
@@ -103,6 +106,7 @@ export const geaRuntimeForEval: Record<string, unknown> = {
   _rescue,
   createItemObservable,
   createItemProxy,
+  readItem,
 }
 
 export function buildEvalPrelude(): string {
@@ -165,6 +169,7 @@ export async function transformGeaSourceToEvalBody(source: string, id: string): 
     .replace(/export default class\s+/g, 'class ')
     .replace(/export default function\s+/g, 'function ')
     .replace(/export class\s+/g, 'class ')
+    .replace(/export function\s+/g, 'function ')
     .replace(/^export type\s+[^;]+;?\s*$/gm, '')
     .replace(/export\s*\{[^}]*\}\s*;?/g, '')
 }

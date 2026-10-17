@@ -74,22 +74,17 @@ export function injectHMR(
       ]),
     ),
   ]
+  acceptBody.push(js`let __patched = false;`)
+  acceptBody.push(js`let __incompatible = false;`)
   for (const cn of componentClassNames) {
     const key = cn === defaultExportClassName ? 'default' : cn
-    acceptBody.push(
-      t.expressionStatement(
-        t.callExpression(t.identifier('handleComponentUpdate'), [
-          t.memberExpression(importMeta(), t.identifier('url')),
-          t.objectExpression([
-            t.objectProperty(
-              t.identifier('default'),
-              t.memberExpression(t.identifier('__updatedModule'), t.identifier(key)),
-            ),
-          ]),
-        ]),
-      ),
-    )
+    acceptBody.push(js`{
+      const __result = handleComponentUpdate(${importMeta()}.url, { default: __updatedModule.${id(key)} });
+      __patched = __result === true || __patched;
+      __incompatible = __result === null || __incompatible;
+    }`)
   }
+  acceptBody.push(js`if (__incompatible || !__patched) ${hot()}.invalidate();`)
   hmrStmts.push(
     t.expressionStatement(
       t.callExpression(t.memberExpression(hot(), t.identifier('accept')), [

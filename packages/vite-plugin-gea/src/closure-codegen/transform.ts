@@ -2,10 +2,11 @@
  * transform — file-level transformer.
  */
 
-import { parse } from '@babel/parser'
-import type { ClassDeclaration, File, TSTypeLiteral } from '@babel/types'
+import type { ClassDeclaration, File, Statement, TSTypeLiteral } from '@babel/types'
 
+import { parseModule } from '../parse/parser.ts'
 import { generate, t } from '../utils/babel-interop.ts'
+import { compilerError } from '../utils/compile-error.ts'
 
 import type { DirectFnComponentParams } from './emit.ts'
 import { buildCreateTemplateMethod, createEmitContext, lowerJsxInStatement } from './emit.ts'
@@ -22,12 +23,19 @@ import {
   type GeaIrRuntimeBase,
 } from './ir.ts'
 import {
+  assertNoReassignedTemplateLocals,
+  bindPropsDestructures,
+  bindPropsPattern,
   bodyContainsJsx,
   canSkipComponentStoreProxy,
   canUseLeanReactiveComponent,
   canUseStaticCompiledComponent,
   canUseTinyReactiveComponent,
+  collectModuleBindings,
   extendsComponent,
+  fnHasConditionalRoot,
+  fnHasInstanceLocals,
+  fnReadsModuleBinding,
   isFunctionComponent,
   nodeContainsThisMember as classBodyReadsThisMember,
   rewriteFnComponent,
@@ -43,6 +51,8 @@ import { extractPrecedingStatements, foldEarlyReturnGuards } from './transform/t
 export interface TransformResult {
   code: string
   map?: any
+  /** Babel's decoded source map, only with `sourceMaps: true`. */
+  decodedMap?: { mappings: number[][][] }
   /** true if any component class was rewritten */
   changed: boolean
   /** names of Component subclasses that were rewritten (diagnostics) */
@@ -62,6 +72,13 @@ export interface TransformFileOptions {
   enableTinyReactiveComponents?: boolean
   /** Compiling for the embedded/native (geatsc/IR) backend. See EmitContext.embedded. */
   embedded?: boolean
+  /** Also return a source map (`map` and `decodedMap`) of the emitted code. */
+  sourceMaps?: boolean
+  /**
+   * A source map from `source` back to the user's file, when `source` is
+   * itself compiler output. The returned map then points at the user's file.
+   */
+  inputSourceMap?: unknown
 }
 
 export function transformFile(source: string, _filename?: string, options: TransformFileOptions = {}): TransformResult {
@@ -70,16 +87,10 @@ export function transformFile(source: string, _filename?: string, options: Trans
     return { code: source, changed: false, rewritten: [], importsNeeded: [] }
   }
 
-  let ast: File
-  try {
-    ast = parse(source, {
-      sourceType: 'module',
-      plugins: ['typescript', 'jsx', 'classProperties', 'classPrivateProperties', 'classPrivateMethods'],
-      errorRecovery: false,
-    })
-  } catch {
-    return { code: source, changed: false, rewritten: [], importsNeeded: [] }
-  }
+  // No catch: the pipeline parsed this source with the same plugins, so a
+  // failure here is a compiler bug. Returning `changed: false` would serve the
+  // file uncompiled.
+  const ast = parseModule(source)
 
   const ctx = createEmitContext()
   ctx.irTemplates = []
@@ -127,6 +138,10 @@ export function transformFile(source: string, _filename?: string, options: Trans
 
     if (classDecl) {
       if (firstClassIdx < 0) firstClassIdx = i
+      // `template()` params and locals bind per class. Starting each class with
+      // empty bindings keeps an earlier class's locals from rewriting same-named
+      // identifiers (a module constant, an import) in this one.
+      ctx.bindings.clear()
       // Collect `get`-accessor names from the class — expressionToPathOrGetter
       // forces getter-form for `this.X` when X is a derived getter.
       ctx.classGetters.clear()
@@ -139,7 +154,7 @@ export function transformFile(source: string, _filename?: string, options: Trans
       // lower. The canonical `template()` is one of them; any sibling method
       // (e.g. gea-mobile's `template_items`, `template_views`) is compiled too.
       const templateMethod = findTemplateMethod(classDecl)
-      if (templateMethod) foldEarlyReturnGuards(templateMethod)
+      if (templateMethod) foldEarlyReturnGuards(templateMethod.body.body)
       const methodsWithJsx: any[] = []
       for (const m of classDecl.body.body) {
         if (!t.isClassMethod(m) || m.computed || m.static) continue
@@ -150,6 +165,14 @@ export function transformFile(source: string, _filename?: string, options: Trans
       if (templateMethod && !extendsComponent(classDecl)) continue
       const jsx = templateMethod ? extractTemplateJsx(templateMethod) : null
       if (templateMethod && !jsx) continue
+      if (templateMethod?.decorators?.length) {
+        throw compilerError(
+          `Decorators on \`template()\` are not supported.`,
+          templateMethod.decorators[0],
+          `The compiler replaces \`template()\` with DOM code, so the decorator would never run. ` +
+            `Decorate another method instead.`,
+        )
+      }
       const useStaticCompiledComponent = canUseStaticCompiledComponent(classDecl)
       const useCompiledComponent = !useStaticCompiledComponent && canSkipComponentStoreProxy(classDecl)
       const useTinyReactiveComponent =
@@ -189,33 +212,51 @@ export function transformFile(source: string, _filename?: string, options: Trans
         continue
       }
 
-      // `template({ count, user })` param destructure → bindings to this.props.<name>
-      const paramBindings: string[] = []
-      if (templateMethod.params.length >= 1 && t.isObjectPattern(templateMethod.params[0])) {
-        for (const prop of (templateMethod.params[0] as any).properties) {
-          if (!t.isObjectProperty(prop) || !t.isIdentifier(prop.key)) continue
-          const local = t.isIdentifier(prop.value) ? prop.value.name : prop.key.name
-          ctx.bindings.set(
-            local,
-            t.memberExpression(
-              t.memberExpression(t.thisExpression(), t.identifier('props')),
-              t.identifier(prop.key.name),
-            ),
+      // A whole-parameter default (`template({ label } = {})`) never applies:
+      // the compiled template reads `this.props`, which is always an object.
+      const templateParam = t.isAssignmentPattern(templateMethod.params[0])
+        ? templateMethod.params[0].left
+        : templateMethod.params[0]
+      // A `template({ … })` parameter pattern binds like a function component's
+      // props parameter, with `this.props` as the source. The locals it still
+      // needs (a `...rest` object) go at the top of the method, since the
+      // compiled method takes `d` in its place.
+      const paramLocals = t.isObjectPattern(templateParam)
+        ? bindPropsPattern(
+            templateParam,
+            'let',
+            ctx.bindings,
+            t.memberExpression(t.thisExpression(), t.identifier('props')),
           )
-          paramBindings.push(local)
-        }
-      }
+        : []
       // `template(props)` plain parameter → bind `props` → this.props
-      let plainPropsParamName: string | null = null
-      if (templateMethod.params.length >= 1 && t.isIdentifier(templateMethod.params[0])) {
-        plainPropsParamName = templateMethod.params[0].name
-        ctx.bindings.set(plainPropsParamName, t.memberExpression(t.thisExpression(), t.identifier('props')))
+      if (t.isIdentifier(templateParam)) {
+        ctx.bindings.set(templateParam.name, t.memberExpression(t.thisExpression(), t.identifier('props')))
       }
 
-      const preceding = extractPrecedingStatements(templateMethod)
+      const templateBody = extractPrecedingStatements(templateMethod)
+      assertNoReassignedTemplateLocals(templateMethod, className, templateBody)
+      // `const { … } = this.props` in the body, or `= props` for a `template(props)`
+      // parameter, binds the same way
+      const propsLocals: Statement[] = [...paramLocals]
+      const preceding = [
+        ...paramLocals,
+        ...bindPropsDestructures(
+          templateBody,
+          (init) =>
+            (t.isMemberExpression(init) &&
+              !init.computed &&
+              t.isThisExpression(init.object) &&
+              t.isIdentifier(init.property, { name: 'props' })) ||
+            (t.isIdentifier(templateParam) && t.isIdentifier(init, { name: templateParam.name })),
+          ctx.bindings,
+          propsLocals,
+          t.memberExpression(t.thisExpression(), t.identifier('props')),
+        ),
+      ]
       const templateSymbol = useStaticCompiledComponent ? 'GEA_STATIC_TEMPLATE' : 'GEA_CREATE_TEMPLATE'
       ctx.importsNeeded.add(templateSymbol)
-      const method = buildCreateTemplateMethod(jsx, ctx, preceding, templateSymbol)
+      const method = buildCreateTemplateMethod(jsx, ctx, preceding, templateSymbol, propsLocals)
       const useStaticElementComponent =
         useStaticCompiledComponent && isStaticBuiltinElementRoot(jsx) && !nodeContainsIdentifier(method.body, 'd')
       if (useStaticElementComponent && ctx.irTemplates) {
@@ -224,9 +265,6 @@ export function transformFile(source: string, _filename?: string, options: Trans
         }
       }
       if (useStaticElementComponent) method.params = []
-      if (plainPropsParamName) ctx.bindings.delete(plainPropsParamName)
-      // Clear per-template bindings so they don't leak to the next class
-      for (const k of paramBindings) ctx.bindings.delete(k)
 
       const isReactiveComponent = reactiveComponentNames.has(className)
       const bodyItems = classDecl.body.body
@@ -271,6 +309,24 @@ export function transformFile(source: string, _filename?: string, options: Trans
         // box the Signal fields) is neutralized downstream. This is the lean,
         // fully-typed counterpart to a Store — it does NOT inherit the store's
         // dynamic per-property observer map.
+        const constructor = classDecl.body.body.find(
+          (member) => t.isClassMethod(member) && member.kind === 'constructor',
+        )
+        if (constructor && t.isClassMethod(constructor)) {
+          const first = constructor.body.body[0]
+          if (
+            !first ||
+            !t.isExpressionStatement(first) ||
+            !t.isCallExpression(first.expression) ||
+            !t.isSuper(first.expression.callee) ||
+            first.expression.arguments.length !== 0
+          ) {
+            throw new Error('ReactiveComponent constructors must start with super() without arguments')
+          }
+          // The native marker has no constructor work. Keeping its super call
+          // after removing the marker emits invalid JavaScript.
+          constructor.body.body.shift()
+        }
         classDecl.superClass = null
         usesCompiledRuntimeBase = false
         // The stripped base (`Component`) carried `el` — the mounted root node.
@@ -345,10 +401,23 @@ export function transformFile(source: string, _filename?: string, options: Trans
   injectTemplateDecls(ast, firstClassIdx, ctx.templateDecls)
   ensureCoreImports(ast, ctx.importsNeeded)
 
-  const out = generate(ast, { retainLines: false, compact: false, jsescOption: { minimal: true } })
+  const out = generate(
+    ast,
+    {
+      retainLines: false,
+      compact: false,
+      jsescOption: { minimal: true },
+      ...(options.sourceMaps
+        ? { sourceMaps: true, sourceFileName: _filename ?? 'source', inputSourceMap: options.inputSourceMap }
+        : {}),
+    },
+    // The map's sourcesContent when there is no inputSourceMap.
+    source,
+  )
   return {
     code: out.code,
     map: (out as any).map,
+    decodedMap: options.sourceMaps ? (out as any).decodedMap : undefined,
     changed: true,
     rewritten,
     importsNeeded: Array.from(ctx.importsNeeded),
@@ -473,10 +542,18 @@ function buildModuleIr(
 function findClassDeclarationByName(ast: File, name: string): ClassDeclaration | null {
   for (const node of ast.program.body) {
     if (t.isClassDeclaration(node) && node.id?.name === name) return node
-    if (t.isExportDefaultDeclaration(node) && t.isClassDeclaration(node.declaration) && node.declaration.id?.name === name) {
+    if (
+      t.isExportDefaultDeclaration(node) &&
+      t.isClassDeclaration(node.declaration) &&
+      node.declaration.id?.name === name
+    ) {
       return node.declaration
     }
-    if (t.isExportNamedDeclaration(node) && t.isClassDeclaration(node.declaration) && node.declaration.id?.name === name) {
+    if (
+      t.isExportNamedDeclaration(node) &&
+      t.isClassDeclaration(node.declaration) &&
+      node.declaration.id?.name === name
+    ) {
       return node.declaration
     }
   }
@@ -618,7 +695,15 @@ function buildAfterRenderAsyncRenderMethod(): any {
 export function collectDirectFnComponents(ast: File): Set<string> {
   const candidates = new Set<string>()
   for (const node of ast.program.body) {
-    if (t.isFunctionDeclaration(node) && node.id && isFunctionComponent(node)) candidates.add(node.id.name)
+    if (
+      t.isFunctionDeclaration(node) &&
+      node.id &&
+      isFunctionComponent(node) &&
+      !fnHasInstanceLocals(node) &&
+      !fnHasConditionalRoot(node)
+    ) {
+      candidates.add(node.id.name)
+    }
   }
   if (candidates.size === 0) return candidates
 
@@ -646,6 +731,17 @@ export function collectDirectFnComponents(ast: File): Set<string> {
 
   for (const name of candidates) {
     if ((counts.get(name) ?? 0) === 0 || disqualified.has(name)) candidates.delete(name)
+  }
+  if (candidates.size === 0) return candidates
+
+  // A direct factory writes each slot once, which is only right for reads of
+  // its own props. One that reads a store or any other module binding goes
+  // through `mount` and keeps reactive bindings.
+  const moduleBindings = collectModuleBindings(ast)
+  for (const node of ast.program.body) {
+    if (t.isFunctionDeclaration(node) && node.id && candidates.has(node.id.name)) {
+      if (fnReadsModuleBinding(node, moduleBindings)) candidates.delete(node.id.name)
+    }
   }
   return candidates
 }
