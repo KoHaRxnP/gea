@@ -11,6 +11,7 @@ import { emitMountSlot } from './emit-mount.ts'
 import { expressionToPathOrGetter } from './emit-reactive-source.ts'
 import { eventHandlerNeedsCurrentTarget } from './emit-event-current-target.ts'
 import { normalizeEventAttrName, type Slot } from '../generator.ts'
+import { classifyAttrKind } from '../generator/generator-attrs.ts'
 
 export function emitSlot(slot: Slot, stmts: Statement[], ctx: EmitContext): void {
   // Substitute destructured identifiers with their source expressions so tracking works
@@ -205,7 +206,10 @@ export function emitSlot(slot: Slot, stmts: Statement[], ctx: EmitContext): void
         ctx.importsNeeded.add('reactiveStyleProp')
         for (const p of styleProps as any[]) {
           const keyName = t.isIdentifier(p.key) ? p.key.name : p.key.value
-          const kebabKey = String(keyName).replace(/[A-Z]/g, (m) => '-' + m.toLowerCase())
+          // Custom properties (`--*`) are case-sensitive: keep them as written.
+          const kebabKey = String(keyName).startsWith('--')
+            ? String(keyName)
+            : String(keyName).replace(/[A-Z]/g, (m) => '-' + m.toLowerCase())
           const valSource = expressionToPathOrGetter(p.value as Expression, ctx)
           stmts.push(
             t.expressionStatement(
@@ -247,6 +251,10 @@ export function emitSlot(slot: Slot, stmts: Statement[], ctx: EmitContext): void
     }
     return
   }
+  if (slot.kind === 'spread') {
+    emitSpreadSlot(slot, stmts, ctx)
+    return
+  }
   if (slot.kind === 'ref') {
     // `ref={this.foo}` → assign the element to `this.foo` after clone. The JSX
     // expression is a member chain (e.g. `this.inputEl`); compile-time we emit
@@ -277,9 +285,61 @@ export function emitSlot(slot: Slot, stmts: Statement[], ctx: EmitContext): void
   throw new Error(`emit: unsupported slot kind '${slot.kind}'`)
 }
 
+/**
+ * `{...obj}` on an element: `reactiveSpread(el, d, root, skip, () => [...sources])`,
+ * or a one-shot `spreadAttrs(el, skip, [...sources])` in a direct function
+ * component, whose props never change.
+ */
+function emitSpreadSlot(slot: Slot, stmts: Statement[], ctx: EmitContext): void {
+  const elId = t.identifier('el' + slot.index)
+  const sources = slot.expr as Expression
+  // Attributes written before a spread bind `this.method` handlers the way an
+  // event attribute does, so `this` is the component when they run.
+  if (t.isArrayExpression(sources)) {
+    for (const i of slot.payload.explicit as number[]) {
+      const group = sources.elements[i]
+      if (!t.isObjectExpression(group)) continue
+      for (const prop of group.properties) {
+        if (!t.isObjectProperty(prop) || !isThisMethod(prop.value)) continue
+        const name = t.isIdentifier(prop.key) ? prop.key.name : t.isStringLiteral(prop.key) ? prop.key.value : ''
+        if (classifyAttrKind(name) !== 'event') continue
+        const ev = t.identifier('e')
+        prop.value = t.arrowFunctionExpression([ev], t.callExpression(prop.value as Expression, [ev]))
+      }
+    }
+  }
+  const skipNames = slot.payload.skip as string[]
+  const skip = skipNames.length > 0 ? t.arrayExpression(skipNames.map((n) => t.stringLiteral(n))) : t.nullLiteral()
+  if (ctx.oneShotProps) {
+    ctx.importsNeeded.add('spreadAttrs')
+    stmts.push(t.expressionStatement(t.callExpression(t.identifier('spreadAttrs'), [elId, skip, sources])))
+    return
+  }
+  const pathOrGetter = expressionToPathOrGetter(sources, ctx)
+  ctx.importsNeeded.add('reactiveSpread')
+  stmts.push(
+    t.expressionStatement(
+      t.callExpression(t.identifier('reactiveSpread'), [
+        elId,
+        t.identifier('d'),
+        ctx.reactiveRoot,
+        skip,
+        pathOrGetter.value,
+      ]),
+    ),
+  )
+}
+
+function isThisMethod(expr: any): boolean {
+  return t.isMemberExpression(expr) && t.isThisExpression(expr.object) && !expr.computed
+}
+
 function canUseScalarTextHelper(expr: Expression): boolean {
   if (containsJsx(expr)) return false
   if (isChildrenExpression(expr)) return false
+  // Any prop can carry a DOM node (`<Layout header={<Title />} />`), so prop
+  // reads need reactiveText's node insertion, not a String() text write.
+  if (isPropsRead(expr)) return false
   if (
     t.isIdentifier(expr) ||
     t.isMemberExpression(expr) ||
@@ -291,9 +351,8 @@ function canUseScalarTextHelper(expr: Expression): boolean {
   ) {
     return true
   }
-  if (t.isBinaryExpression(expr)) {
-    return canUseScalarTextHelper(expr.left as Expression) && canUseScalarTextHelper(expr.right as Expression)
-  }
+  // Binary operators always yield a primitive, even when an operand is a prop.
+  if (t.isBinaryExpression(expr)) return true
   if (t.isLogicalExpression(expr)) {
     return canUseScalarTextHelper(expr.left as Expression) && canUseScalarTextHelper(expr.right as Expression)
   }
@@ -316,6 +375,21 @@ function isChildrenExpression(expr: Expression): boolean {
     return isChildrenExpression(expr.expression as Expression)
   }
   return false
+}
+
+/** `this.props.x…` in class components, `props.x…` in function components (param is always renamed to `props`). */
+function isPropsRead(expr: Expression): boolean {
+  if (t.isTSAsExpression(expr) || t.isTSTypeAssertion(expr) || t.isTSNonNullExpression(expr)) {
+    return isPropsRead(expr.expression as Expression)
+  }
+  let node: Expression = expr
+  while (t.isMemberExpression(node)) {
+    if (t.isThisExpression(node.object) && !node.computed && t.isIdentifier(node.property, { name: 'props' })) {
+      return true
+    }
+    node = node.object as Expression
+  }
+  return t.isIdentifier(node, { name: 'props' })
 }
 
 function isStringClassExpression(expr: Expression): boolean {

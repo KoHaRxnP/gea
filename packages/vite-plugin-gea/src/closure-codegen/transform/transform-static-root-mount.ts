@@ -1,4 +1,4 @@
-import { parse } from '@babel/parser'
+import type { Scope } from '@babel/traverse'
 import type {
   ClassDeclaration,
   Expression,
@@ -10,19 +10,27 @@ import type {
 import { readFileSync } from 'node:fs'
 import { dirname, relative } from 'node:path'
 
+import { parseModule } from '../../parse/parser.ts'
 import { generate, t, traverse } from '../../utils/babel-interop.ts'
 import {
-  collectBindings,
+  bindTemplateLocals,
   compileJsxToBlock,
   createEmitContext,
-  lowerJsxInStatement,
-  substituteBindings,
+  keptTemplateStatements,
   type DirectFnComponentParams,
 } from '../emit.ts'
 import { extractTemplateJsx, findTemplateMethod } from '../generator.ts'
 import { extractPrecedingStatements, foldEarlyReturnGuards } from './transform-template-methods.ts'
 import { collectDirectFnComponentParams, collectDirectFnComponents, collectDirectFnStringProps } from '../transform.ts'
-import { canUseStaticCompiledComponent, rewriteFnComponent } from './transform-components.ts'
+import {
+  assertNoReassignedTemplateLocals,
+  canUseStaticCompiledComponent,
+  classHasDecorators,
+  fnHasConditionalRoot,
+  fnHasInstanceLocals,
+  isFunctionComponent,
+  rewriteFnComponent,
+} from './transform-components.ts'
 import { ensureCoreImports } from './transform-imports.ts'
 
 interface MountPattern {
@@ -61,10 +69,7 @@ export function transformStaticRootMount(
 
   let ast: File
   try {
-    ast = parse(source, {
-      sourceType: 'module',
-      plugins: ['typescript', 'jsx', 'classProperties', 'classPrivateProperties', 'classPrivateMethods'],
-    })
+    ast = parseModule(source)
   } catch {
     return null
   }
@@ -81,7 +86,15 @@ export function transformStaticRootMount(
   const resolved = resolveImportPath(filePath, imported.source)
   if (!resolved) return null
 
-  const factory = createStaticTemplateFactory(resolved, '__gea_root0', filePath, resolveImportPath)
+  let factory: StaticTemplateFactory | null
+  try {
+    factory = createStaticTemplateFactory(resolved, '__gea_root0', filePath, resolveImportPath)
+  } catch {
+    // Inlining is only an optimization. Without it the root component goes
+    // through the pipeline on its own, which reports any compile error
+    // against the component's file instead of this mount file.
+    return null
+  }
   if (!factory) return null
 
   ast.program.body.splice(
@@ -90,7 +103,9 @@ export function transformStaticRootMount(
     createAppendStatement(pattern.parent, factory),
   )
   removeDefaultImport(ast, pattern.appImport)
-  insertDeclarationsAfterImports(ast, factory.imports)
+  const copiedImports = importsMissingFromEntry(ast, filePath, factory, resolveImportPath)
+  if (!copiedImports) return null
+  insertDeclarationsAfterImports(ast, copiedImports)
   insertDeclarationsAfterImports(ast, factory.declarations)
   ensureCoreImports(ast, factory.importsNeeded)
 
@@ -175,10 +190,7 @@ function createStaticTemplateFactory(
 
   let ast: File
   try {
-    ast = parse(source, {
-      sourceType: 'module',
-      plugins: ['typescript', 'jsx', 'classProperties', 'classPrivateProperties', 'classPrivateMethods'],
-    })
+    ast = parseModule(source)
   } catch {
     return null
   }
@@ -187,9 +199,23 @@ function createStaticTemplateFactory(
   if (!classDecl || !canUseStaticCompiledComponent(classDecl)) return null
   if (!hasNoRootModuleTopLevelSideEffects(ast, classDecl)) return null
   const templateMethod = findTemplateMethod(classDecl)
-  if (templateMethod) foldEarlyReturnGuards(templateMethod)
+  if (templateMethod) foldEarlyReturnGuards(templateMethod.body.body)
   const jsx = templateMethod ? extractTemplateJsx(templateMethod) : null
   if (!jsx || !isBuiltinElementRoot(jsx)) return null
+
+  // Local function components that hold per-instance state or pick their
+  // root with a condition are kept out of the direct set and need a real
+  // mount, which the static factory lacks.
+  if (
+    ast.program.body.some(
+      (stmt) =>
+        t.isFunctionDeclaration(stmt) &&
+        isFunctionComponent(stmt) &&
+        (fnHasInstanceLocals(stmt) || fnHasConditionalRoot(stmt)),
+    )
+  ) {
+    return null
+  }
 
   const ctx = createEmitContext()
   const watchFiles = new Set<string>()
@@ -223,6 +249,10 @@ function createStaticTemplateFactory(
   const fnDecls: Statement[] = []
   for (const stmt of ast.program.body) {
     if (!t.isFunctionDeclaration(stmt) || !stmt.id || !ctx.directFnComponents.has(stmt.id.name)) continue
+    // Only the direct functions are copied into the mount file. One that still
+    // names a binding left behind, like `<Card>` used with children, would
+    // throw a ReferenceError there.
+    if (nodeContainsAnyIdentifier(stmt.body, blockedRootBindings)) return null
     rewriteFnComponent(stmt, ctx)
     const alias = getZeroArgFactoryAlias(stmt)
     if (alias) {
@@ -233,7 +263,8 @@ function createStaticTemplateFactory(
   }
 
   const preceding = extractPrecedingStatements(templateMethod)
-  if (preceding.length > 0) collectBindings(preceding, ctx.bindings)
+  assertNoReassignedTemplateLocals(templateMethod, classDecl.id?.name ?? '<anonymous>', preceding)
+  bindTemplateLocals(preceding, ctx)
   const block = compileJsxToBlock(jsx, ctx)
   if (
     ctx.importsNeeded.has('keyedList') ||
@@ -242,17 +273,7 @@ function createStaticTemplateFactory(
   ) {
     return null
   }
-  const keptPreceding = preceding
-    .filter((s) => {
-      if (t.isReturnStatement(s) || t.isThrowStatement(s)) return false
-      if (t.isVariableDeclaration(s)) {
-        const allPatterns = s.declarations.every((d) => t.isObjectPattern(d.id) || t.isArrayPattern(d.id))
-        if (allPatterns) return false
-      }
-      return true
-    })
-    .map((s) => substituteBindings(s, ctx.bindings))
-    .map((s) => lowerJsxInStatement(s, ctx))
+  const keptPreceding = keptTemplateStatements(preceding, ctx)
   const rootUsesDisposer = nodeContainsIdentifier(block, 'd')
   const disposerArg = rootUsesDisposer ? [t.callExpression(t.identifier('createDisposer'), [])] : []
   if (rootUsesDisposer) ctx.importsNeeded.add('createDisposer')
@@ -304,6 +325,78 @@ function collectCopiedImports(
   return imports
 }
 
+/**
+ * The copied imports and declarations land in the entry's module scope. A
+ * copied import the entry already has (same name, same export of the same
+ * module) is dropped. Any other name the entry already binds would be declared
+ * twice, so the mount is left as it is.
+ */
+function importsMissingFromEntry(
+  ast: File,
+  entryPath: string,
+  factory: StaticTemplateFactory,
+  resolveImportPath: (importer: string, source: string) => string | null,
+): ImportDeclaration[] | null {
+  let scope: Scope | undefined
+  traverse(ast, {
+    Program(path) {
+      scope = path.scope
+      path.stop()
+    },
+  })
+  if (!scope) return null
+
+  for (const decl of factory.declarations) {
+    for (const name of Object.keys(t.getOuterBindingIdentifiers(decl))) {
+      if (scope.hasOwnBinding(name)) return null
+    }
+  }
+
+  const imports: ImportDeclaration[] = []
+  for (const copy of factory.imports) {
+    const specifiers: ImportDeclaration['specifiers'] = []
+    for (const spec of copy.specifiers) {
+      const binding = scope.getOwnBinding(spec.local.name)
+      if (!binding) {
+        specifiers.push(spec)
+        continue
+      }
+      const entryImport = binding.path.parent
+      if (
+        !t.isImportDeclaration(entryImport) ||
+        entryImport.importKind === 'type' ||
+        specifierIsTypeOnly(binding.path.node) ||
+        importedBindingName(binding.path.node) !== importedBindingName(spec) ||
+        !isSameModule(entryPath, entryImport.source.value, copy.source.value, resolveImportPath)
+      ) {
+        return null
+      }
+    }
+    if (copy.specifiers.length > 0 && specifiers.length === 0) continue
+    copy.specifiers = specifiers
+    imports.push(copy)
+  }
+  return imports
+}
+
+function importedBindingName(spec: t.Node): string | null {
+  if (t.isImportNamespaceSpecifier(spec)) return '*'
+  return getImportedExportName(spec)
+}
+
+// Both sources are relative to the entry: copied relative sources were rewritten to it.
+function isSameModule(
+  entryPath: string,
+  a: string,
+  b: string,
+  resolveImportPath: (importer: string, source: string) => string | null,
+): boolean {
+  if (a === b) return true
+  if (!a.startsWith('.') || !b.startsWith('.')) return false
+  const resolved = resolveImportPath(entryPath, a)
+  return resolved !== null && resolved === resolveImportPath(entryPath, b)
+}
+
 function toRelativeImportSource(fromFile: string, targetFile: string): string {
   let source = relative(dirname(fromFile), targetFile).replace(/\\/g, '/')
   if (!source.startsWith('.')) source = './' + source
@@ -339,7 +432,10 @@ function collectImportedStaticFunctionComponents(
       const fnDecl = getExportedFunction(imported.ast, exportedName, localName)
       if (fnDecl) {
         const params = getDirectFnParams(fnDecl)
-        if (!params || !functionReturnsJsx(fnDecl)) {
+        // Per-instance locals and a conditional root need reactive reads,
+        // which the one-shot direct path doesn't emit, so call the
+        // component's own compiled export.
+        if (!params || !functionReturnsJsx(fnDecl) || fnHasInstanceLocals(fnDecl) || fnHasConditionalRoot(fnDecl)) {
           ctx.directFactoryComponents?.add(localName)
           continue
         }
@@ -379,10 +475,7 @@ function readImportModule(componentPath: string): { ast: File } | null {
   }
   let ast: File
   try {
-    ast = parse(source, {
-      sourceType: 'module',
-      plugins: ['typescript', 'jsx', 'classProperties', 'classPrivateProperties', 'classPrivateMethods'],
-    })
+    ast = parseModule(source)
   } catch {
     return null
   }
@@ -670,7 +763,10 @@ function hasNoRootModuleTopLevelSideEffects(ast: File, classDecl: ClassDeclarati
       continue
     }
     if (t.isExportDefaultDeclaration(stmt)) {
-      if (stmt.declaration === classDecl) continue
+      if (stmt.declaration === classDecl) {
+        if (classHasDecorators(classDecl)) return false
+        continue
+      }
       if (
         t.isIdentifier(stmt.declaration) &&
         classDecl.id &&
@@ -697,6 +793,8 @@ function hasNoRootModuleTopLevelSideEffects(ast: File, classDecl: ClassDeclarati
 }
 
 function isSideEffectFreeClassDeclaration(stmt: ClassDeclaration): boolean {
+  // Decorators run when the class is defined; inlining would drop them.
+  if (classHasDecorators(stmt)) return false
   for (const member of stmt.body.body) {
     if (t.isStaticBlock(member)) return false
     if (member.static && (t.isClassProperty(member) || t.isClassPrivateProperty(member))) return false
@@ -956,6 +1054,7 @@ function nodeContainsIdentifier(node: unknown, name: string): boolean {
 function nodeContainsAnyIdentifier(node: unknown, names: Set<string>): boolean {
   if (names.size === 0 || !node || typeof node !== 'object') return false
   if (t.isIdentifier(node) && names.has(node.name)) return true
+  if (t.isJSXOpeningElement(node) && jsxTagReferencesAny(node.name, names)) return true
   if (Array.isArray(node)) {
     for (const child of node) if (nodeContainsAnyIdentifier(child, names)) return true
     return false
@@ -965,4 +1064,16 @@ function nodeContainsAnyIdentifier(node: unknown, names: Set<string>): boolean {
     if (nodeContainsAnyIdentifier((node as Record<string, unknown>)[key], names)) return true
   }
   return false
+}
+
+// A JSX tag reads a binding when it names a component (<Card>) or starts a
+// member expression (<ui.Card>). Lowercase tags are HTML elements, and
+// attribute names are JSXIdentifiers that never read a binding.
+function jsxTagReferencesAny(name: unknown, names: Set<string>): boolean {
+  if (t.isJSXMemberExpression(name)) {
+    let object = name.object
+    while (t.isJSXMemberExpression(object)) object = object.object
+    return names.has(object.name)
+  }
+  return t.isJSXIdentifier(name) && isComponentName(name.name) && names.has(name.name)
 }

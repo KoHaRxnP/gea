@@ -15,7 +15,8 @@
  *        │
  *        ▼
  * ┌──────────────┐
- * │  Preprocess   │  Functional-to-class conversion (if needed)
+ * │  Preprocess   │  Arrow components → function declarations,
+ * │               │  functional-to-class conversion (if needed)
  * └──────┬───────┘
  *        │
  *        ▼
@@ -44,11 +45,16 @@
 import { generate, traverse, t } from './utils/babel-interop.ts'
 import { parseSource } from './parse/parser.ts'
 import { convertFunctionalToClass } from './preprocess/functional-to-class.ts'
-import { transformFile } from './closure-codegen/transform.ts'
+import { normalizeArrowComponents } from './preprocess/arrow-components.ts'
+import { transformFile, type TransformResult } from './closure-codegen/transform.ts'
 import { injectHMR } from './postprocess/hmr.ts'
+import { compilerError, isGeaCompileError, type GeaCompileError } from './utils/compile-error.ts'
 import { isComponentTag, pascalToKebabCase } from './utils/component-tags.ts'
 import { ensureGeaCompilerSymbolImports } from './utils/imports.ts'
 import type { GeaIrComponent, GeaIrModule } from './closure-codegen/ir.ts'
+
+const COMPILER_BUG_HINT =
+  'This is a bug in the Gea compiler. Please report it at https://github.com/dashersw/gea/issues'
 
 export interface CompilerContext {
   sourceFile: string
@@ -81,7 +87,9 @@ function isComponentImportSource(source: string): boolean {
  * before the store module is loaded, so the store can safely import the component
  * classes back without hitting the temporal dead zone.
  */
-export function transform(ctx: CompilerContext): { code: string; map: any; ir?: { module: GeaIrModule; components: GeaIrComponent[] } } | null {
+export function transform(
+  ctx: CompilerContext,
+): { code: string; map: any; ir?: { module: GeaIrModule; components: GeaIrComponent[] } } | null {
   const { sourceFile, code, isServe, hmrImportSource } = ctx
 
   // ── Quick checks ──────────────────────────────────────────────────────
@@ -89,9 +97,37 @@ export function transform(ctx: CompilerContext): { code: string; map: any; ir?: 
   if (!hasAngleBrackets) return null
 
   // ── Parse ─────────────────────────────────────────────────────────────
+  let sourceParsed = false
   try {
-    const parsed = parseSource(code)
+    let parsed = parseSource(code)
     if (!parsed) return null
+    sourceParsed = true
+
+    // Each print → re-parse round trip below moves node locations into the
+    // printed code. Printing with the previous step's map as `inputSourceMap`
+    // gives a map from the printed code back to `code`, so the final source
+    // map still points at the user's file. `sourceMap` covers `source`;
+    // `astMap` covers the locations in `ast`. Neither is set while they are
+    // still positions in `code`.
+    const print = (node: t.Node, inputSourceMap: unknown) =>
+      generate(node, { retainLines: true, sourceMaps: true, sourceFileName: sourceFile, inputSourceMap }, code)
+
+    // ── Preprocess: arrow components → function declarations ──────────
+    // transformFile only compiles `function` components. Rewrite arrow
+    // components first so every later phase (metadata, functional → class,
+    // codegen) works on the same source. `retainLines` keeps the line numbers
+    // of compile errors pointing at the user's file.
+    let source = code
+    let sourceMap: unknown
+    if (parsed.hasJSX && normalizeArrowComponents(parsed.ast, sourceFile)) {
+      const printed = print(parsed.ast, undefined)
+      source = printed.code
+      sourceMap = printed.map
+      parsed = parseSource(source)
+      if (!parsed) return null
+    }
+    let astMap = sourceMap
+
     const { functionalComponentInfo, hasJSX } = parsed
     let { ast, imports } = parsed
     let { componentClassNames } = parsed
@@ -102,11 +138,12 @@ export function transform(ctx: CompilerContext): { code: string; map: any; ir?: 
     if (functionalComponentInfo) {
       convertFunctionalToClass(ast, functionalComponentInfo, imports)
       componentClassNames = [functionalComponentInfo.name]
-      const freshCode = generate(ast, { retainLines: true }).code
-      const freshParsed = parseSource(freshCode)
+      const fresh = print(ast, astMap)
+      const freshParsed = parseSource(fresh.code)
       if (freshParsed) {
         ast = freshParsed.ast
         imports = freshParsed.imports
+        astMap = fresh.map
       }
     }
 
@@ -187,19 +224,28 @@ export function transform(ctx: CompilerContext): { code: string; map: any; ir?: 
     // No fallback. If transformFile can't rewrite this file's JSX, leave it.
     let ir: { module: GeaIrModule; components: GeaIrComponent[] } | undefined
     if (hasJSX) {
-      const emitted = transformFile(code, sourceFile, {
+      const transformOptions = {
         directClassComponents: knownClassComponentImports,
         directFactoryComponents: knownFactoryComponentImports,
         enableTinyReactiveComponents: !isServe,
         embedded: ctx.embedded,
-      })
+        sourceMaps: true,
+        inputSourceMap: sourceMap,
+      }
+      const emitted = transformFile(source, sourceFile, transformOptions)
       if (emitted.changed) {
         ir = emitted.ir
         // Re-parse the transformed code so the downstream passes (HMR, __geaTagName
         // injection, symbol imports, source-map generation) run against the new AST.
-        const reparsed = parseSource(emitted.code)
+        let reparsed: ReturnType<typeof parseSource>
+        try {
+          reparsed = parseSource(emitted.code)
+        } catch (error) {
+          throw invalidEmitError(error, emitted.decodedMap)
+        }
         if (reparsed) {
           ast.program.body = reparsed.ast.program.body
+          astMap = emitted.map
           transformed = true
           // Dev/HMR-only component tag metadata. Production bundles do not need it.
           if (isServe) {
@@ -266,13 +312,57 @@ export function transform(ctx: CompilerContext): { code: string; map: any; ir?: 
     ensureGeaCompilerSymbolImports(ast)
 
     // ── Emit ──────────────────────────────────────────────────────────
-    const output = generate(ast, { sourceMaps: true, sourceFileName: sourceFile }, code)
+    const output = generate(ast, { sourceMaps: true, sourceFileName: sourceFile, inputSourceMap: astMap }, code)
     return { code: output.code, map: output.map, ir }
   } catch (error: any) {
-    if (error?.__geaCompileError) {
-      throw error
-    }
-    console.warn(`[gea-plugin] Failed to transform ${sourceFile}:`, error.message, '\n', error.stack)
-    return null
+    // The only soft failure: Babel can't parse the file's own source. Its
+    // jsx+typescript parser rejects some valid TypeScript (`<T>value` in a .ts
+    // file), and Vite's own parser still reports real syntax errors.
+    if (!sourceParsed) return null
+    if (isGeaCompileError(error)) throw withSourceFile(error, sourceFile)
+    const err = compilerError(`Internal compiler error: ${reasonOf(error)}`, null, COMPILER_BUG_HINT)
+    err.cause = error
+    throw withSourceFile(err, sourceFile)
   }
+}
+
+/** The error message without Babel's ` (line:column)` suffix, which may be a position in generated code. */
+function reasonOf(error: any): string {
+  return String(error?.message ?? error).replace(/ \(\d+:\d+\)$/, '')
+}
+
+/**
+ * Babel rejected the code transformFile emitted, so its position is in that
+ * code, not the user's. Map it back through the emit's source map.
+ */
+function invalidEmitError(error: any, decodedMap: TransformResult['decodedMap']): GeaCompileError {
+  const err = compilerError(`The compiled output is invalid JavaScript: ${reasonOf(error)}`, null, COMPILER_BUG_HINT)
+  err.cause = error
+  const at = error?.loc
+  if (!at) return err
+  const segments = decodedMap?.mappings[at.line - 1] ?? []
+  // Last segment starting at or before the error column; a segment is
+  // [generatedColumn, sourceIndex, sourceLine (0-based), sourceColumn].
+  const segment = segments.filter((s) => s.length >= 4 && s[0] <= at.column).pop()
+  if (segment) err.loc = { line: segment[2] + 1, column: segment[3] }
+  return err
+}
+
+/**
+ * Put the file and location in the message and in Vite's `loc`, so the dev
+ * overlay and a failed `vite build` both point at the source. Drops Babel's
+ * `pos`: Vite would build a code frame from it without checking which code
+ * it belongs to.
+ */
+function withSourceFile(err: GeaCompileError, sourceFile: string): Error {
+  const where = err.loc ? `${sourceFile}:${err.loc.line}:${err.loc.column}` : sourceFile
+  const [first, ...rest] = err.message.split('\n')
+  const out = new Error([`[gea] ${first} (${where})`, ...rest].join('\n'), { cause: err.cause }) as GeaCompileError & {
+    id?: string
+  }
+  out.__geaCompileError = true
+  out.hint = err.hint
+  out.id = sourceFile
+  if (err.loc) out.loc = { file: sourceFile, line: err.loc.line, column: err.loc.column }
+  return out
 }

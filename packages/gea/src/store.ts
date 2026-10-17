@@ -11,18 +11,20 @@
 import { GEA_PROXY_RAW, GEA_STORE_ROOT } from './runtime/symbols'
 import { GEA_OBSERVE_DIRECT } from './runtime/internal-symbols'
 import { trackRead } from './runtime/with-tracking'
+import { isClassConstructorValue } from './runtime/class-constructor'
 export { GEA_DIRTY, GEA_DIRTY_PROPS } from './runtime/dirty-symbols'
 import { GEA_DIRTY as _DIRTY, GEA_DIRTY_PROPS as _DIRTY_PROPS } from './runtime/dirty-symbols'
 
-const _isArr = Array.isArray
-const _getProto = Object.getPrototypeOf
-const _objProto = Object.prototype
-const _isPlain = (v: any): boolean => {
+// Same reason the `Array.isArray` alias went away: `Object.getPrototypeOf` and
+// `Object.prototype` were module-level consts holding intrinsic values, which
+// have no native carrier. Called/compared in place they lower as ordinary
+// intrinsic operations.
+function _isPlain(v: any): boolean {
   if (!v || typeof v !== 'object') return false
-  const p = _getProto(v)
-  return p === _objProto || p === null || _isArr(v)
+  const p = Object.getPrototypeOf(v)
+  return p === Object.prototype || p === null || Array.isArray(v)
 }
-const _unwrapProxy = (v: any): any => {
+function _unwrapProxy(v: any): any {
   const raw = v && typeof v === 'object' ? v[GEA_PROXY_RAW] : undefined
   return raw && _isPlain(raw) ? raw : v
 }
@@ -43,6 +45,8 @@ export interface Change {
   count?: number
   /** In-place array-item property update — arix = item index in the parent array. */
   aipu?: boolean
+  /** The item carries dirty-property metadata for the keyed-list fast path. */
+  itemDirty?: boolean
   arix?: number
   /** Value after change. */
   newValue?: any
@@ -62,23 +66,13 @@ export function samePathParts(a?: string[], b?: string[]): boolean {
   return true
 }
 
-export function isClassConstructorValue(fn: unknown): boolean {
-  if (typeof fn !== 'function') return false
-  try {
-    const d = Object.getOwnPropertyDescriptor(fn, 'prototype')
-    return !!(d && d.writable === false)
-  } catch {
-    return true
-  }
-}
-
 /**
  * Walk the prototype chain for `prop`. Used by the root proxy (and SSR overlay) so
  * `set`/`delete` on accessors do not go through reactive write paths — framework
  * getters/setters skip change notifications; user data fields remain plain.
  */
 export function findPropertyDescriptor(obj: any, prop: string): PropertyDescriptor | undefined {
-  for (let o: any = obj; o; o = _getProto(o)) {
+  for (let o: any = obj; o; o = Object.getPrototypeOf(o)) {
     const d = Object.getOwnPropertyDescriptor(o, prop)
     if (d) return d
   }
@@ -282,7 +276,7 @@ function _wrapNested(raw: Store, p: StorePrivate, target: any, rootProp: string)
       trackRead(raw, rootProp)
       const val = obj[prop as string]
       // Intercept mutating array methods to notify on the root prop
-      if (_isArr(obj) && typeof val === 'function' && _MUTATING[prop as string]) {
+      if (Array.isArray(obj) && typeof val === 'function' && _MUTATING[prop as string]) {
         return function (this: any[], ...args: any[]) {
           const beforeLen = (obj as any[]).length
           const isRootArr = (obj as any[]) === (raw as any)[rootProp]
@@ -340,7 +334,7 @@ function _wrapNested(raw: Store, p: StorePrivate, target: any, rootProp: string)
       // Dirty tracking: array-index writes mark the new value (the replaced
       // item object); object property writes mark the container.
       // keyed-list patchRow scans items for _DIRTY, patches, and clears.
-      if (_isArr(obj)) {
+      if (Array.isArray(obj)) {
         if (value && typeof value === 'object') (value as any)[_DIRTY] = true
         const idx = +(prop as string)
         if (Number.isInteger(idx) && (obj as any[]) === (raw as any)[rootProp]) {
@@ -361,7 +355,7 @@ function _wrapNested(raw: Store, p: StorePrivate, target: any, rootProp: string)
       }
       const old = obj[prop as string]
       delete obj[prop as string]
-      if (!_isArr(obj)) (obj as any)[_DIRTY] = true
+      if (!Array.isArray(obj)) (obj as any)[_DIRTY] = true
       _queue(raw, p, rootProp, { previousValue: old })
       return true
     },

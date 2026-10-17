@@ -12,17 +12,28 @@ import { bind } from './bind'
  *
  * Slow path (multi-token strings, arrays, objects) still uses Set-diff.
  */
-export const reactiveClass = (
+export function reactiveClass(
   el: Element,
   d: Disposer,
-  root: any,
+  root: object,
   pathOrGetter: readonly string[] | (() => unknown),
-): void => {
+): void {
+  bind(d, root, pathOrGetter, classWriter(el))
+}
+
+/** The write step of `reactiveClass`: applies each value it is called with,
+ * diffed against the previous one. Spread attributes reuse it per element. */
+export function classWriter(el: Element): (v: unknown) => void {
   let prev: string | Set<string> | null = null
-  bind(d, root, pathOrGetter, (v) => {
+  return (v) => {
     // Single-token fast path: null/false/empty or whitespace-free string.
-    if (v == null || v === false || v === '' || (typeof v === 'string' && v.indexOf(' ') === -1)) {
-      const next = v == null || v === false ? '' : (v as string)
+    // `text` carries the narrowed string in its own `string` slot so `indexOf`
+    // has an exact string receiver; calling it on `v` — declared `unknown` —
+    // leaves the intrinsic without one. Equivalent: every branch that reaches
+    // `next` has `v` either nullish/false (→ '') or a string (→ `text`).
+    const text = typeof v === 'string' ? (v as string) : ''
+    if (v == null || v === false || v === '' || (typeof v === 'string' && text.indexOf(' ') === -1)) {
+      const next = v == null || v === false ? '' : text
       if (typeof prev === 'string') {
         if (prev === next) return
         if (prev) el.classList.remove(prev)
@@ -58,5 +69,5 @@ export const reactiveClass = (
     }
     if (next.size === 0 && !el.hasAttribute('class')) el.setAttribute('class', '')
     prev = next
-  })
+  }
 }

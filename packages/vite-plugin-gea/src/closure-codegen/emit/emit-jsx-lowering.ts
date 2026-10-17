@@ -2,34 +2,24 @@ import type { ClassMethod, Statement } from '@babel/types'
 
 import { t } from '../../utils/babel-interop.ts'
 
-import { collectBindings, type EmitContext } from './emit-context.ts'
+import { collectBindings, initializerNeedsLocal, type EmitContext } from './emit-context.ts'
 import { compileJsxToBlock } from './emit-core.ts'
 import { substituteBindings } from './emit-substitution.ts'
 
+/**
+ * `propsLocals` are the real locals left by `this.props` destructuring (see
+ * bindPropsPattern). They are kept as they are instead of being inlined.
+ */
 export function buildCreateTemplateMethod(
   jsxRoot: any,
   ctx: EmitContext,
-  preceding?: Statement[],
+  preceding: Statement[] = [],
   templateSymbol = 'GEA_CREATE_TEMPLATE',
+  propsLocals: Statement[] = [],
 ): ClassMethod {
-  if (preceding && preceding.length > 0) collectBindings(preceding, ctx.bindings)
+  bindTemplateLocals(preceding, ctx, propsLocals)
   const jsxBlock = compileJsxToBlock(jsxRoot, ctx)
-  // Drop destructuring declarations from preceding — their identifiers have been inlined.
-  // Keep other statements (non-destructuring consts, function decls) so they remain in scope.
-  // ALSO substitute bindings into them so `const taskIds = column.taskIds` becomes
-  // `const taskIds = this.props.column.taskIds` (or whatever the binding maps to).
-  const keptPreceding = (preceding ?? [])
-    .filter((s) => {
-      if (t.isReturnStatement(s) || t.isThrowStatement(s)) return false
-      if (t.isVariableDeclaration(s)) {
-        const allPatterns = s.declarations.every((d) => t.isObjectPattern(d.id) || t.isArrayPattern(d.id))
-        if (allPatterns) return false
-      }
-      return true
-    })
-    .map((s) => substituteBindings(s, ctx.bindings))
-    .map((s) => lowerJsxInStatement(s, ctx))
-  const stmts = keptPreceding.concat(jsxBlock.body)
+  const stmts = keptTemplateStatements(preceding, ctx, propsLocals).concat(jsxBlock.body)
   return t.classMethod(
     'method',
     t.identifier(templateSymbol),
@@ -38,6 +28,47 @@ export function buildCreateTemplateMethod(
     true,
     false,
   )
+}
+
+/**
+ * Bind the locals declared before `return` in a template() body so reads
+ * inline their initializer. A local whose initializer constructs something or
+ * writes state stays a real variable instead, created once per instance, as
+ * do `propsLocals`.
+ */
+export function bindTemplateLocals(preceding: Statement[], ctx: EmitContext, propsLocals: Statement[] = []): void {
+  collectBindings(
+    preceding.filter((s) => !propsLocals.includes(s)),
+    ctx.bindings,
+    initializerNeedsLocal,
+  )
+}
+
+/**
+ * The statements before `return` that stay in the emitted template body.
+ * Destructuring declarations are dropped once their names have been inlined.
+ * Everything else stays in scope with bindings substituted, so
+ * `const taskIds = column.taskIds` becomes
+ * `const taskIds = this.props.column.taskIds` (or whatever the binding maps to).
+ */
+export function keptTemplateStatements(
+  preceding: Statement[],
+  ctx: EmitContext,
+  propsLocals: Statement[] = [],
+): Statement[] {
+  return preceding
+    .filter((s) => {
+      if (t.isReturnStatement(s) || t.isThrowStatement(s)) return false
+      if (t.isVariableDeclaration(s) && !propsLocals.includes(s)) {
+        const inlined = s.declarations.every(
+          (d) => (t.isObjectPattern(d.id) || t.isArrayPattern(d.id)) && !(d.init && initializerNeedsLocal(d.init)),
+        )
+        if (inlined) return false
+      }
+      return true
+    })
+    .map((s) => substituteBindings(s, ctx.bindings))
+    .map((s) => lowerJsxInStatement(s, ctx))
 }
 
 /**
