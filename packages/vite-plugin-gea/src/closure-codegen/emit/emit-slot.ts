@@ -553,10 +553,10 @@ function buildDirectPropsArgs(attrs: any[], propNames: string[], ctx: EmitContex
     if (!t.isJSXAttribute(attr)) continue
     const name = getAttrName(attr)
     if (!name || name === 'key') continue
-    values.set(name, getDirectAttrValue(attr, ctx) ?? t.identifier('undefined'))
+    values.set(name, getDirectAttrValue(attr, ctx) ?? t.unaryExpression('void', t.numericLiteral(0), true))
   }
   appendStaticChildrenValue(values, attrs)
-  return propNames.map((name) => values.get(name) ?? t.identifier('undefined'))
+  return propNames.map((name) => values.get(name) ?? t.unaryExpression('void', t.numericLiteral(0), true))
 }
 
 function buildDirectPropsObject(attrs: any[], ctx: EmitContext): Expression {
