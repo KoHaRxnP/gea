@@ -20,4 +20,20 @@ describe('convertFunctionalToClass - default props', () => {
     assert.match(output, /class MyComponent/)
     assert.match(output, /template\(\s*{\s*class: cls = "default-class"\s*}\s*\)/)
   })
+
+it('preserves props for body destructuring with default values', () => {
+    const code = `
+      export default function MyComponent(props) {
+        const { class: cls = "default-class" } = props;
+        return <div className={cls}>{props.children}</div>;
+      }
+    `
+    const ast = parse(code, { sourceType: 'module', plugins: ['jsx'] })
+    convertFunctionalToClass(ast, { name: 'MyComponent', kind: 'default' }, new Map())
+
+    const output = generate(ast).code
+    assert.match(output, /template\(\s*props\s*\)/)
+    assert.match(output, /const\s*{\s*class: cls = "default-class"\s*}\s*=\s*props/)
+    assert.match(output, /props\.children/)
+  })
 })
