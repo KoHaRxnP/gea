@@ -1,8 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { parse } from '@babel/parser'
+import { runInNewContext } from 'node:vm'
+import { JSDOM } from 'jsdom'
 import _generate from '@babel/generator'
-import { convertFunctionalToClass } from '../../src/preprocess/functional-to-class.js'
 import { emitSlot } from '../../src/closure-codegen/emit/emit-slot.js'
 import { t } from '../../src/utils/babel-interop.js'
 
@@ -30,20 +30,49 @@ describe('emitSlot and functional components - missing children & props fallback
     emitSlot(slot as any, stmts, mockContext)
 
     const generatedCode = stmts.map((s) => generate(s).code).join('\n')
-    assert.ok(generatedCode.includes('void 0'))
+    assert.match(generatedCode, /FooButton\(\s*void 0,\s*d\s*\)/)
   })
 
-  it('does not render placeholder 0 when children are omitted in functional components', () => {
-    const code = `
-      export default function FooButton({ children }) {
-        return <button>{children}</button>;
-      }
+  it('renders a blank button when children are omitted, not placeholder 0', () => {
+    const mockContext = {
+      bindings: new Map(),
+      reactiveRoot: t.identifier('root'),
+      importsNeeded: new Set(),
+      directFnComponentParams: new Map([['FooButton', { props: ['children'] }]]),
+    } as any
 
-      const element = <FooButton />;
-    `
-    const ast = parse(code, { sourceType: 'module', plugins: ['jsx'] })
-    convertFunctionalToClass(ast, { name: 'FooButton', kind: 'default' }, new Map())
-    const output = generate(ast).code
-    assert.ok(!output.includes('>0<'), 'Missing children should not result in static 0 placeholder')
+    const slot = {
+      kind: 'direct-fn',
+      index: 1,
+      payload: {
+        tag: 'FooButton',
+        attrs: [],
+      },
+    }
+
+    const stmts: any[] = []
+    emitSlot(slot as any, stmts, mockContext)
+
+    const generatedCode = stmts.map((s) => generate(s).code).join('\n')
+
+    // Execute the emitted slot code against a minimal DOM-backed component.
+    // An omitted children prop must reach FooButton as undefined, not 0 or d.
+    const dom = new JSDOM('<!doctype html><html><body></body></html>')
+    const anchor1 = dom.window.document.createComment('slot')
+    dom.window.document.body.append(anchor1)
+
+    const FooButton = (children: unknown, _disposer: unknown) => {
+      const button = dom.window.document.createElement('button')
+      if (children != null) button.textContent = String(children)
+      return button
+    }
+
+    runInNewContext(generatedCode, {
+      FooButton,
+      d: () => {},
+      anchor1,
+    })
+
+    assert.equal(dom.window.document.body.innerHTML, '<button></button>')
   })
 })
