@@ -38,6 +38,8 @@ describe('emitSlot and functional components - missing children & props fallback
       export default function FooButton({ children }) {
         return <button>{children}</button>;
       }
+
+      const element = <FooButton />;
     `
     const ast = parse(code, { sourceType: 'module', plugins: ['jsx'] })
     convertFunctionalToClass(ast, { name: 'FooButton', kind: 'default' }, new Map())
